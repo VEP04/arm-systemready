@@ -53,7 +53,7 @@ insmod /lib/modules/cppc_cpufreq.ko
 
 sleep 5
 
-SR_VERSION="SystemReady band ACS v3.1.1"
+SR_VERSION="SystemReady band ACS v3.1.1 RC-final"
 
 #Skip running of ACS Tests if the grub option is added
 ADDITIONAL_CMD_OPTION="";
@@ -234,8 +234,8 @@ if [ $ADDITIONAL_CMD_OPTION != "noacs" ]; then
         # display port, mass storage, network controller...SKIP them
         /bin/bsa --skip-dp-nic-ms >> /mnt/acs_results/linux/BsaResultsApp.log
       else
-        echo "Running command $bsa_command --skip PCI_MM_03 --skip-dp-nic-ms"
-        $bsa_command --skip PCI_MM_03 --skip-dp-nic-ms  >> /mnt/acs_results/linux/BsaResultsApp.log
+        echo "Running command $bsa_command --skip-dp-nic-ms"
+        $bsa_command --skip-dp-nic-ms  >> /mnt/acs_results/linux/BsaResultsApp.log
       fi
       dmesg | sed -n 'H; /PE_INFO/h; ${g;p;}' > /mnt/acs_results/linux/BsaResultsKernel.log
       sync /mnt
@@ -245,6 +245,7 @@ if [ $ADDITIONAL_CMD_OPTION != "noacs" ]; then
       echo "Error: BSA kernel Driver is not found. Linux BSA tests cannot be run."
     fi
   fi
+
 
   # Linux SBSA Execution
   echo "Running Linux SBSA tests"
@@ -256,8 +257,8 @@ if [ $ADDITIONAL_CMD_OPTION != "noacs" ]; then
       if [ -f  /lib/modules/sbsa_acs.ko ]; then
         insmod /lib/modules/sbsa_acs.ko
         echo "${SR_VERSION}" > /mnt/acs_results/linux/SbsaResultsApp.log
-        echo "Running command $sbsa_command --skip PCI_MM_03 --skip-dp-nic-ms"
-        $sbsa_command --skip PCI_MM_03 --skip-dp-nic-ms >> /mnt/acs_results/linux/SbsaResultsApp.log
+        echo "Running command $sbsa_command --skip S_L3_01 --skip-dp-nic-ms"
+        $sbsa_command --skip S_L3_01 --skip-dp-nic-ms >> /mnt/acs_results/linux/SbsaResultsApp.log
         dmesg | sed -n 'H; /PE_INFO/h; ${g;p;}' > /mnt/acs_results/linux/SbsaResultsKernel.log
         sync /mnt
         sleep 5
