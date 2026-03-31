@@ -25,6 +25,7 @@ suites:
         expect_stdout_or_stderr_contains:
           - "Usage: python3 verify_tpm_measurements.py"
 
+
       - name: cli_missing_files_fail_nonzero
         type: cli
         args:
