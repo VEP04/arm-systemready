@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import ast
+import importlib.util
 import os
 import py_compile
+import re
 import shlex
+import shutil
 import subprocess
 import sys
+import tempfile
 import traceback
 import xml.etree.ElementTree as xml_et
 from dataclasses import dataclass, field
@@ -206,6 +210,8 @@ def validate_post_checks(post_checks: Any, field_name: str) -> None:
         "file_contains",
         "file_not_contains",
         "file_not_empty",
+        "regex",
+        "ordered_contains",
     }
 
     for index, check in enumerate(checks, start=1):
@@ -232,6 +238,18 @@ def validate_post_checks(post_checks: Any, field_name: str) -> None:
             if not isinstance(text, str):
                 raise ConfigError(f"{entry_name}.text must be a string")
 
+        if check_type == "regex":
+            pattern = check.get("pattern")
+            if not isinstance(pattern, str):
+                raise ConfigError(f"{entry_name}.pattern must be a string")
+
+        if check_type == "ordered_contains":
+            texts = check.get("texts")
+            if not isinstance(texts, list) or not all(
+                isinstance(item, str) for item in texts
+            ):
+                raise ConfigError(f"{entry_name}.texts must be a list of strings")
+
 
 def validate_case_schema(case_def: dict[str, Any], field_name: str) -> None:
     case_name = case_def.get("name")
@@ -252,6 +270,8 @@ def validate_case_schema(case_def: dict[str, Any], field_name: str) -> None:
         "function_exists_any",
         "main_guard",
         "cli",
+        "py_function",
+        "module_main_with_env",
     }:
         raise ConfigError(f"{field_name}.type unsupported: {case_type}")
 
@@ -275,12 +295,91 @@ def validate_case_schema(case_def: dict[str, Any], field_name: str) -> None:
                     f"{field_name}.bin_files entries must be string -> mapping"
                 )
             hex_data = spec.get("hex")
-            if not isinstance(hex_data, str):
+            text_data = spec.get("text")
+            if hex_data is None and text_data is None:
+                raise ConfigError(
+                    f"{field_name}.bin_files['{key}'] requires 'hex' or 'text'"
+                )
+            if hex_data is not None and not isinstance(hex_data, str):
                 raise ConfigError(
                     f"{field_name}.bin_files['{key}'].hex must be a string"
                 )
+            if text_data is not None and not isinstance(text_data, str):
+                raise ConfigError(
+                    f"{field_name}.bin_files['{key}'].text must be a string"
+                )
+
+    if "text_files" in case_def and case_def["text_files"] is not None:
+        text_files = case_def["text_files"]
+        if not isinstance(text_files, dict):
+            raise ConfigError(f"{field_name}.text_files must be a mapping")
+        for key, value in text_files.items():
+            if not isinstance(key, str) or not isinstance(value, str):
+                raise ConfigError(
+                    f"{field_name}.text_files entries must be string -> string"
+                )
+
+    if "patch_constants" in case_def and case_def["patch_constants"] is not None:
+        patch_constants = case_def["patch_constants"]
+        if not isinstance(patch_constants, dict):
+            raise ConfigError(f"{field_name}.patch_constants must be a mapping")
+        for key, value in patch_constants.items():
+            if not isinstance(key, str):
+                raise ConfigError(
+                    f"{field_name}.patch_constants keys must be strings"
+                )
+            if not isinstance(value, (str, int, float, bool)):
+                raise ConfigError(
+                    f"{field_name}.patch_constants['{key}'] "
+                    "must be a scalar string/int/float/bool"
+                )
+
+    if "dir_structure" in case_def and case_def["dir_structure"] is not None:
+        dir_structure = case_def["dir_structure"]
+        if not isinstance(dir_structure, list):
+            raise ConfigError(f"{field_name}.dir_structure must be a list")
+        for index, entry in enumerate(dir_structure, start=1):
+            if not isinstance(entry, dict):
+                raise ConfigError(
+                    f"{field_name}.dir_structure[{index}] must be a mapping"
+                )
+            if not isinstance(entry.get("path"), str):
+                raise ConfigError(
+                    f"{field_name}.dir_structure[{index}].path must be a string"
+                )
 
     validate_post_checks(case_def.get("post_checks"), f"{field_name}.post_checks")
+
+    if case_type == "py_function":
+        function_name = case_def.get("function")
+        if not isinstance(function_name, str) or not function_name.strip():
+            raise ConfigError(f"{field_name}.function must be a non-empty string")
+
+        args = case_def.get("args", [])
+        if not isinstance(args, list):
+            raise ConfigError(f"{field_name}.args must be a list")
+
+        kwargs = case_def.get("kwargs")
+        if kwargs is not None and not isinstance(kwargs, dict):
+            raise ConfigError(f"{field_name}.kwargs must be a mapping")
+
+        if "expect_exception" in case_def and not isinstance(
+            case_def["expect_exception"], str
+        ):
+            raise ConfigError(f"{field_name}.expect_exception must be a string")
+
+        if "expect_return_contains" in case_def and not isinstance(
+            case_def["expect_return_contains"], str
+        ):
+            raise ConfigError(f"{field_name}.expect_return_contains must be a string")
+
+        return
+
+    if case_type == "module_main_with_env":
+        expected_exit_code = case_def.get("expect_exit_code")
+        if expected_exit_code is not None and not isinstance(expected_exit_code, int):
+            raise ConfigError(f"{field_name}.expect_exit_code must be an integer")
+        return
 
     if case_type != "cli":
         return
@@ -435,6 +534,16 @@ def expand_template(value: str, work_dir: Path, file_path: Path) -> str:
     return value.format(dir=str(work_dir), file=str(file_path), filename=file_path.name)
 
 
+def replace_dir_tokens(value: Any, temp_dir: Path) -> Any:
+    if isinstance(value, str):
+        return value.replace("{dir}", str(temp_dir))
+    if isinstance(value, list):
+        return [replace_dir_tokens(item, temp_dir) for item in value]
+    if isinstance(value, dict):
+        return {key: replace_dir_tokens(item, temp_dir) for key, item in value.items()}
+    return value
+
+
 def prepare_case_files(work_dir: Path, case_def: dict[str, Any]) -> None:
     scripts = case_def.get("scripts", {})
     if scripts is not None:
@@ -455,17 +564,44 @@ def prepare_case_files(work_dir: Path, case_def: dict[str, Any]) -> None:
         for name, spec in bin_files.items():
             if not isinstance(name, str) or not isinstance(spec, dict):
                 raise ConfigError("'bin_files' entries must be string -> mapping")
-            hex_data = spec.get("hex")
-            if not isinstance(hex_data, str):
-                raise ConfigError("Each 'bin_files' entry requires string key 'hex'")
+
             target_file = work_dir / name
             target_file.parent.mkdir(parents=True, exist_ok=True)
-            try:
-                target_file.write_bytes(bytes.fromhex(hex_data))
-            except ValueError as exc:
+
+            hex_data = spec.get("hex")
+            text_data = spec.get("text")
+            if hex_data is not None:
+                if not isinstance(hex_data, str):
+                    raise ConfigError(
+                        f"Invalid hex data type for bin_files entry '{name}'"
+                    )
+                try:
+                    target_file.write_bytes(bytes.fromhex(hex_data))
+                except ValueError as exc:
+                    raise ConfigError(
+                        f"Invalid hex data for bin_files entry '{name}': {exc}"
+                    ) from exc
+            elif text_data is not None:
+                if not isinstance(text_data, str):
+                    raise ConfigError(
+                        f"Invalid text data type for bin_files entry '{name}'"
+                    )
+                target_file.write_bytes(text_data.encode("utf-8"))
+            else:
                 raise ConfigError(
-                    f"Invalid hex data for bin_files entry '{name}': {exc}"
-                ) from exc
+                    "Each 'bin_files' entry requires string key 'hex' or 'text'"
+                )
+
+    text_files = case_def.get("text_files", {})
+    if text_files is not None:
+        if not isinstance(text_files, dict):
+            raise ConfigError("'text_files' must be a mapping")
+        for name, content in text_files.items():
+            if not isinstance(name, str) or not isinstance(content, str):
+                raise ConfigError("'text_files' entries must be string -> string")
+            target_file = work_dir / name
+            target_file.parent.mkdir(parents=True, exist_ok=True)
+            target_file.write_text(content, encoding="utf-8")
 
 
 def render_post_check_path(raw_path: str, work_dir: Path) -> Path:
@@ -551,9 +687,78 @@ def run_post_checks(work_dir: Path, post_checks: Any) -> tuple[bool, list[str]]:
                 all_passed = False
             continue
 
+        if check_type == "regex":
+            pattern = check.get("pattern")
+            if not isinstance(pattern, str):
+                raise ConfigError(
+                    f"post_checks[{index}] requires string key 'pattern'"
+                )
+
+            if not resolved.exists() or not resolved.is_file():
+                messages.append(
+                    f"post_check regex: {resolved} matches {pattern!r} -> FAIL"
+                )
+                all_passed = False
+                continue
+
+            contents = resolved.read_text(encoding="utf-8", errors="replace")
+            passed = re.search(pattern, contents, flags=re.MULTILINE) is not None
+            messages.append(
+                f"post_check regex: {resolved} matches {pattern!r} -> "
+                f"{'PASS' if passed else 'FAIL'}"
+            )
+            if not passed:
+                all_passed = False
+            continue
+
+        if check_type == "ordered_contains":
+            texts = check.get("texts")
+            if not isinstance(texts, list) or not all(
+                isinstance(item, str) for item in texts
+            ):
+                raise ConfigError(
+                    f"post_checks[{index}] requires key 'texts' as list[str]"
+                )
+
+            if not resolved.exists() or not resolved.is_file():
+                messages.append(f"post_check ordered_contains: {resolved} -> FAIL")
+                all_passed = False
+                continue
+
+            contents = resolved.read_text(encoding="utf-8", errors="replace")
+            start = 0
+            passed = True
+            for text in texts:
+                idx = contents.find(text, start)
+                if idx == -1:
+                    passed = False
+                    messages.append(
+                        f"post_check ordered_contains: {resolved} "
+                        f"missing {text!r} in order -> FAIL"
+                    )
+                    all_passed = False
+                    break
+                start = idx + len(text)
+
+            if passed:
+                messages.append(f"post_check ordered_contains: {resolved} -> PASS")
+            continue
+
         raise ConfigError(f"post_checks[{index}] unsupported type: {check_type}")
 
     return all_passed, messages
+
+
+def load_module_from_path(file_path: Path) -> Any:
+    spec = importlib.util.spec_from_file_location(
+        f"runner_module_{sanitize_name(file_path.stem)}",
+        str(file_path),
+    )
+    if spec is None or spec.loader is None:
+        raise ConfigError(f"Could not load module from {file_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def check_file_exists(
@@ -667,6 +872,165 @@ def check_main_guard(
     passed = any(pattern in source for pattern in patterns)
     message = "Main guard found" if passed else "Main guard not found"
     return passed, message, "", False
+
+
+def check_py_function(
+    file_path: Path,
+    case_def: dict[str, Any],
+    _work_dir: Path,
+) -> tuple[bool, str, str, bool]:
+    module = load_module_from_path(file_path)
+
+    function_name = case_def.get("function")
+    if not isinstance(function_name, str):
+        raise ConfigError("'py_function' requires a string 'function'")
+
+    if not hasattr(module, function_name):
+        return False, f"Function not found: {function_name}", "", False
+
+    func = getattr(module, function_name)
+    args = case_def.get("args", [])
+    kwargs = case_def.get("kwargs", {})
+
+    if not isinstance(args, list):
+        raise ConfigError("'py_function.args' must be a list")
+    if not isinstance(kwargs, dict):
+        raise ConfigError("'py_function.kwargs' must be a mapping")
+
+    expected_exception = case_def.get("expect_exception")
+
+    passed = True
+    message = ""
+    details = ""
+    is_error = False
+
+    try:
+        result = func(*args, **kwargs)
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        if expected_exception:
+            passed = exc.__class__.__name__ == expected_exception
+            message = (
+                f"Raised expected exception: {expected_exception}"
+                if passed
+                else f"Expected {expected_exception}, got {exc.__class__.__name__}: {exc}"
+            )
+            details = traceback.format_exc()
+            is_error = not passed
+        else:
+            passed = False
+            message = f"Unexpected exception: {exc}"
+            details = traceback.format_exc()
+            is_error = True
+        return passed, message, details, is_error
+
+    if expected_exception:
+        return (
+            False,
+            f"Expected exception {expected_exception}, but function returned",
+            repr(result),
+            False,
+        )
+
+    expected_return = case_def.get("expect_return")
+    if "expect_return" in case_def and result != expected_return:
+        passed = False
+        message = f"Expected return {expected_return!r}, got {result!r}"
+
+    expected_fragment = case_def.get("expect_return_contains")
+    if expected_fragment is not None and expected_fragment not in str(result):
+        passed = False
+        message = f"Expected return to contain {expected_fragment!r}, got {result!r}"
+
+    if passed:
+        message = f"Function returned {result!r}"
+
+    return passed, message, details, is_error
+
+
+def check_module_main_with_env(
+    file_path: Path,
+    case_def: dict[str, Any],
+    _work_dir: Path,
+) -> tuple[bool, str, str, bool]:
+    temp_dir = Path(tempfile.mkdtemp(prefix="runner_env_"))
+    details_lines: list[str] = [f"Temp dir: {temp_dir}"]
+
+    try:
+        runtime_case = dict(case_def)
+        runtime_case["scripts"] = replace_dir_tokens(
+            runtime_case.get("scripts", {}),
+            temp_dir,
+        )
+        runtime_case["bin_files"] = replace_dir_tokens(
+            runtime_case.get("bin_files", {}),
+            temp_dir,
+        )
+        runtime_case["text_files"] = replace_dir_tokens(
+            runtime_case.get("text_files", {}),
+            temp_dir,
+        )
+
+        dir_structure = replace_dir_tokens(
+            runtime_case.get("dir_structure", []),
+            temp_dir,
+        )
+        for entry in dir_structure:
+            rel_path = entry["path"]
+            dir_path = temp_dir / rel_path
+            dir_path.mkdir(parents=True, exist_ok=True)
+            details_lines.append(f"Created directory: {dir_path}")
+
+        prepare_case_files(temp_dir, runtime_case)
+
+        module = load_module_from_path(file_path)
+
+        patch_constants = replace_dir_tokens(
+            runtime_case.get("patch_constants", {}),
+            temp_dir,
+        )
+        for attr_name, attr_value in patch_constants.items():
+            setattr(module, attr_name, attr_value)
+            details_lines.append(f"Patched constant: {attr_name}={attr_value!r}")
+
+        try:
+            exit_code = module.main()
+        except SystemExit as exc:
+            exit_code = exc.code if isinstance(exc.code, int) else 0
+
+        details_lines.append(f"Exit code: {exit_code}")
+
+        expected_exit_code = runtime_case.get("expect_exit_code")
+        if expected_exit_code is not None and exit_code != expected_exit_code:
+            return (
+                False,
+                f"Expected exit code {expected_exit_code}, got {exit_code}",
+                "\n".join(details_lines),
+                False,
+            )
+
+        post_passed, post_messages = run_post_checks(
+            temp_dir,
+            runtime_case.get("post_checks"),
+        )
+        details_lines.extend(["--- POST CHECKS ---", *post_messages])
+
+        if not post_passed:
+            failed_messages = [message for message in post_messages if "FAIL" in message]
+            return (
+                False,
+                "; ".join(failed_messages) if failed_messages else "Post checks failed",
+                "\n".join(details_lines),
+                False,
+            )
+
+        return True, "Module main() check passed", "\n".join(details_lines), False
+
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        details_lines.append(traceback.format_exc())
+        return False, f"Unhandled exception: {exc}", "\n".join(details_lines), True
+
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 def validate_output_expectations(
@@ -903,6 +1267,8 @@ CHECK_HANDLERS: dict[
     "function_exists_any": check_function_exists_any,
     "main_guard": check_main_guard,
     "cli": check_cli,
+    "py_function": check_py_function,
+    "module_main_with_env": check_module_main_with_env,
 }
 
 
