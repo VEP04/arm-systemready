@@ -9,9 +9,25 @@ suites:
 
       - name: python_compiles
         type: py_compile
-        
 
-      - name: contains_test_order_key_checks
+      - name: has_main_guard
+        type: main_guard
+
+      - name: required_helpers_exist
+        type: source_contains_all
+        patterns:
+          - "def get_required_compliant_ifaces():"
+          - "def init_iface_results(iface):"
+          - "def set_result(iface, test_name, status, detail=\"\"):"
+          - "def skip_many(iface, test_names, reason):"
+          - "def print_summary():"
+          - "def is_busybox_tool(tool_name):"
+          - "def is_virtual_iface(iface):"
+          - "def renew_dhcp(intrf, busybox_env):"
+          - "def has_default_route(dev):"
+          - "def cleanup():"
+
+      - name: expected_test_order_keywords_exist
         type: source_contains_all
         patterns:
           - "Detect interface"
@@ -27,23 +43,6 @@ suites:
           - "wget and curl"
           - "IPv6 address present"
           - "Ping ipv6.google.com (IPv6)"
-
-      - name: contains_required_helpers
-        type: source_contains_all
-        patterns:
-          - "def get_required_compliant_ifaces():"
-          - "def init_iface_results(iface):"
-          - "def set_result(iface, test_name, status, detail=\"\"):"
-          - "def skip_many(iface, test_names, reason):"
-          - "def print_summary():"
-          - "def is_busybox_tool(tool_name):"
-          - "def is_virtual_iface(iface):"
-          - "def renew_dhcp(intrf, busybox_env):"
-          - "def has_default_route(dev):"
-          - "def cleanup():"
-
-      - name: has_main_guard
-        type: main_guard
 
       - name: cli_no_ethernet_interfaces_exits_nonzero
         type: cli

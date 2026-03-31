@@ -10,6 +10,9 @@ suites:
       - name: python_compiles
         type: py_compile
 
+      - name: has_main_guard
+        type: main_guard
+
       - name: cli_requires_many_inputs
         type: cli
         args: []
@@ -116,6 +119,8 @@ suites:
         post_checks:
           - type: exists
             path: "{dir}/summary.html"
+          - type: file_not_empty
+            path: "{dir}/summary.html"
           - type: file_contains
             path: "{dir}/summary.html"
             text: "BSA content"
@@ -203,6 +208,9 @@ suites:
           - "{file}"
         expect_exit_code: 0
         post_checks:
+          - type: file_contains
+            path: "{dir}/summary.html"
+            text: "BSA"
           - type: file_not_contains
             path: "{dir}/summary.html"
             text: "RESULT SUMMARY"
