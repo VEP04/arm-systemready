@@ -59,6 +59,13 @@ suites:
           - "{dir}/fwts.json"
           - "{dir}/waiver.json"
         expect_exit_code: 0
+        post_checks:
+          - type: file_contains
+            path: "{dir}/fwts.json"
+            text: "WITH WAIVER"
+          - type: file_not_contains
+            path: "{dir}/fwts.json"
+            text: "(WITH WAIVER) (WITH WAIVER)"
 
       - name: testsuite_level_waiver_applies_only_to_matching_testsuite
         type: cli
@@ -107,6 +114,13 @@ suites:
           - "{dir}/fwts.json"
           - "{dir}/waiver.json"
         expect_exit_code: 0
+        post_checks:
+          - type: file_contains
+            path: "{dir}/fwts.json"
+            text: "Specific suite waiver"
+          - type: file_contains
+            path: "{dir}/fwts.json"
+            text: "\"Test_suite\": \"OtherSuite\""
 
       - name: category_non_waivable_blocks_waiver_application
         type: cli
@@ -199,8 +213,15 @@ suites:
           - "{dir}/waiver.json"
           - "{dir}/category.json"
         expect_exit_code: 0
+        post_checks:
+          - type: file_contains
+            path: "{dir}/fwts.json"
+            text: "WITH WAIVER"
+          - type: file_not_contains
+            path: "{dir}/fwts.json"
+            text: "(WITH WAIVER) (WITH WAIVER)"
 
-      - name: fwts_subtestid_waiver_applies_by_number
+      - name: fwts_subtest_description_waiver_applies
         type: cli
         text_files:
           fwts.json: |
@@ -229,8 +250,8 @@ suites:
                       "TestCase": {
                         "SubTests": [
                           {
-                            "SubTestID": "42",
-                            "Reason": "ID-based waiver"
+                            "sub_Test_Description": "something",
+                            "Reason": "Description-based waiver"
                           }
                         ]
                       }
@@ -244,6 +265,13 @@ suites:
           - "{dir}/fwts.json"
           - "{dir}/waiver.json"
         expect_exit_code: 0
+        post_checks:
+          - type: file_contains
+            path: "{dir}/fwts.json"
+            text: "WITH WAIVER"
+          - type: file_contains
+            path: "{dir}/fwts.json"
+            text: "Description-based waiver"
 
       - name: fwts_does_not_duplicate_existing_with_waiver_marker
         type: cli
@@ -277,6 +305,13 @@ suites:
           - "{dir}/fwts.json"
           - "{dir}/waiver.json"
         expect_exit_code: 0
+        post_checks:
+          - type: file_contains
+            path: "{dir}/fwts.json"
+            text: "WITH WAIVER"
+          - type: file_not_contains
+            path: "{dir}/fwts.json"
+            text: "(WITH WAIVER) (WITH WAIVER)"
 
       - name: malformed_waiver_file_does_not_modify_json
         type: cli
@@ -303,6 +338,8 @@ suites:
           - "{dir}/fwts.json"
           - "{dir}/waiver.json"
         expect_exit_code: 0
+        expect_stdout_or_stderr_contains:
+          - "INFO: Failed to read or parse"
         post_checks:
           - type: file_not_contains
             path: "{dir}/fwts.json"
@@ -319,20 +356,9 @@ suites:
                   "testcases": [
                     {
                       "Test_case": "RULE_001",
-                      "test_result": "FAILED"
+                      "Test_result": "FAILED"
                     }
-                  ],
-                  "test_suite_summary": {
-                    "Total Rules Run": 1,
-                    "Passed": 0,
-                    "Passed (Partial)": 0,
-                    "Warnings": 0,
-                    "Skipped": 0,
-                    "Failed": 1,
-                    "PAL Not Supported": 0,
-                    "Not Implemented": 0,
-                    "Total_failed_with_waiver": 0
-                  }
+                  ]
                 }
               ]
             }
@@ -360,8 +386,15 @@ suites:
           - "{dir}/bsa.json"
           - "{dir}/waiver.json"
         expect_exit_code: 0
+        post_checks:
+          - type: file_contains
+            path: "{dir}/bsa.json"
+            text: "WITH WAIVER"
+          - type: file_not_contains
+            path: "{dir}/bsa.json"
+            text: "(WITH WAIVER) (WITH WAIVER)"
 
-      - name: quiet_mode_suppresses_normal_success_message
+      - name: quiet_mode_runs_and_updates_json
         type: cli
         text_files:
           fwts.json: |
@@ -394,3 +427,7 @@ suites:
           - "{dir}/waiver.json"
           - --quiet
         expect_exit_code: 0
+        post_checks:
+          - type: file_contains
+            path: "{dir}/fwts.json"
+            text: "WITH WAIVER"
