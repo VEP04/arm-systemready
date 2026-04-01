@@ -361,6 +361,7 @@ suites:
         expect_stdout_or_stderr_contains:
           - "eth0"
 
+
       - name: cli_full_success
         type: cli
         command: "./run_case.sh"

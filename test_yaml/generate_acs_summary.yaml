@@ -172,6 +172,7 @@ suites:
             path: "{dir}/summary.html"
             text: "standalone"
 
+
       - name: cli_removes_result_summary_headings_case_insensitively
         type: cli
         command: "./run_case.sh"
