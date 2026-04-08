@@ -1,0 +1,247 @@
+suites:
+  - name: capsule_ondisk_reporting_vars_check
+    files:
+      - common/linux_scripts/capsule_ondisk_reporting_vars_check.py
+
+    cases:
+      - name: file_exists
+        type: file_exists
+
+      - name: python_compiles
+        type: py_compile
+
+      - name: has_main_guard
+        type: main_guard
+
+      - name: status_true_returns_passed
+        type: py_function
+        function: status
+        args: [true]
+        expect_return: "PASSED"
+
+      - name: status_false_returns_warning
+        type: py_function
+        function: status
+        args: [false]
+        expect_return: "WARNING"
+
+      - name: decode_valid_utf16le_returns_capsule_name
+        type: py_function
+        function: decode_char16_11_no_nul
+        args:
+          - !!binary |
+            QwBhAHAAcwB1AGwAZQAwADAAMAAxAA==
+        expect_return: "Capsule0001"
+
+      - name: missing_efivarfs_returns_1_and_logs_warning
+        type: module_main_with_env
+        patch_constants:
+          EFIVAR_PATH: "{dir}/missing_efivars"
+          LOG_FILE: "{dir}/capsule.log"
+        expect_exit_code: 1
+        post_checks:
+          - type: exists
+            path: "{dir}/capsule.log"
+          - type: file_contains
+            path: "{dir}/capsule.log"
+            text: "Please ensure efivarfs is enabled and mounted"
+          - type: file_contains
+            path: "{dir}/capsule.log"
+            text: "Overall Capsule On-Disk Update Reporting Variables Result: WARNING"
+
+      - name: missing_os_indications_returns_2_and_skips
+        type: module_main_with_env
+        patch_constants:
+          EFIVAR_PATH: "{dir}/efivars"
+          LOG_FILE: "{dir}/capsule.log"
+        dir_structure:
+          - path: efivars
+        expect_exit_code: 2
+        post_checks:
+          - type: exists
+            path: "{dir}/capsule.log"
+          - type: file_contains
+            path: "{dir}/capsule.log"
+            text: "OsIndicationsSupported not found or unreadable"
+          - type: file_contains
+            path: "{dir}/capsule.log"
+            text: "Overall Capsule On-Disk Update Reporting Variables Result: SKIPPED"
+
+      - name: os_indications_without_capsule_support_bit_returns_2
+        type: module_main_with_env
+        patch_constants:
+          EFIVAR_PATH: "{dir}/efivars"
+          LOG_FILE: "{dir}/capsule.log"
+        dir_structure:
+          - path: efivars
+        bin_files:
+          efivars/OsIndicationsSupported-8be4df61-93ca-11d2-aa0d-00e098032b8c:
+            hex: "070000000000000000000000"
+        expect_exit_code: 2
+        post_checks:
+          - type: file_contains
+            path: "{dir}/capsule.log"
+            text: "not applicable - SKIPPED"
+
+      - name: support_claimed_but_missing_capsule_variables_returns_3
+        type: module_main_with_env
+        patch_constants:
+          EFIVAR_PATH: "{dir}/efivars"
+          LOG_FILE: "{dir}/capsule.log"
+        dir_structure:
+          - path: efivars
+        bin_files:
+          efivars/OsIndicationsSupported-8be4df61-93ca-11d2-aa0d-00e098032b8c:
+            hex: "070000000400000000000000"
+        expect_exit_code: 3
+        post_checks:
+          - type: file_contains
+            path: "{dir}/capsule.log"
+            text: "CapsuleMax Variable - Not Found or Not Accessible"
+          - type: file_contains
+            path: "{dir}/capsule.log"
+            text: "CapsuleLast Variable - Not Found or Not Accessible"
+          - type: file_contains
+            path: "{dir}/capsule.log"
+            text: "No CapsuleNNNN reporting variables found - WARNING"
+          - type: file_contains
+            path: "{dir}/capsule.log"
+            text: "Overall Capsule On-Disk Update Reporting Variables Result: WARNING"
+
+      - name: capsulemax_wrong_attributes_returns_3
+        type: module_main_with_env
+        patch_constants:
+          EFIVAR_PATH: "{dir}/efivars"
+          LOG_FILE: "{dir}/capsule.log"
+        dir_structure:
+          - path: efivars
+        bin_files:
+          efivars/OsIndicationsSupported-8be4df61-93ca-11d2-aa0d-00e098032b8c:
+            hex: "070000000400000000000000"
+          efivars/CapsuleMax-39b68c46-f7fb-441b-b6ec-16b0f69821f3:
+            hex: "07000000430061007000730075006c0065003000300030003100"
+          efivars/CapsuleLast-39b68c46-f7fb-441b-b6ec-16b0f69821f3:
+            hex: "07000000430061007000730075006c0065003000300030003100"
+          efivars/Capsule0001-39b68c46-f7fb-441b-b6ec-16b0f69821f3:
+            hex: "07000000AA"
+        expect_exit_code: 3
+        post_checks:
+          - type: file_contains
+            path: "{dir}/capsule.log"
+            text: "CapsuleMax Variable Attribute Test"
+          - type: file_contains
+            path: "{dir}/capsule.log"
+            text: "Status - WARNING"
+
+      - name: malformed_capsulelast_value_returns_3
+        type: module_main_with_env
+        patch_constants:
+          EFIVAR_PATH: "{dir}/efivars"
+          LOG_FILE: "{dir}/capsule.log"
+        dir_structure:
+          - path: efivars
+        bin_files:
+          efivars/OsIndicationsSupported-8be4df61-93ca-11d2-aa0d-00e098032b8c:
+            hex: "070000000400000000000000"
+          efivars/CapsuleMax-39b68c46-f7fb-441b-b6ec-16b0f69821f3:
+            hex: "06000000430061007000730075006c0065003000300030003100"
+          efivars/CapsuleLast-39b68c46-f7fb-441b-b6ec-16b0f69821f3:
+            hex: "07000000420061006400560061006c0075006500000000000000"
+          efivars/Capsule0001-39b68c46-f7fb-441b-b6ec-16b0f69821f3:
+            hex: "07000000AA"
+        expect_exit_code: 3
+        post_checks:
+          - type: file_contains
+            path: "{dir}/capsule.log"
+            text: "CapsuleLast Variable Test: WARNING"
+
+      - name: missing_capsulelast_returns_3
+        type: module_main_with_env
+        patch_constants:
+          EFIVAR_PATH: "{dir}/efivars"
+          LOG_FILE: "{dir}/capsule.log"
+        dir_structure:
+          - path: efivars
+        bin_files:
+          efivars/OsIndicationsSupported-8be4df61-93ca-11d2-aa0d-00e098032b8c:
+            hex: "070000000400000000000000"
+          efivars/CapsuleMax-39b68c46-f7fb-441b-b6ec-16b0f69821f3:
+            hex: "06000000430061007000730075006c0065003000300030003100"
+          efivars/Capsule0001-39b68c46-f7fb-441b-b6ec-16b0f69821f3:
+            hex: "07000000AA"
+        expect_exit_code: 3
+        post_checks:
+          - type: file_contains
+            path: "{dir}/capsule.log"
+            text: "CapsuleLast Variable - Not Found or Not Accessible"
+
+      - name: inaccessible_capsule_nnnn_variable_returns_3
+        type: module_main_with_env
+        patch_constants:
+          EFIVAR_PATH: "{dir}/efivars"
+          LOG_FILE: "{dir}/capsule.log"
+        dir_structure:
+          - path: efivars
+        bin_files:
+          efivars/OsIndicationsSupported-8be4df61-93ca-11d2-aa0d-00e098032b8c:
+            hex: "070000000400000000000000"
+          efivars/CapsuleMax-39b68c46-f7fb-441b-b6ec-16b0f69821f3:
+            hex: "06000000430061007000730075006c0065003000300030003100"
+          efivars/CapsuleLast-39b68c46-f7fb-441b-b6ec-16b0f69821f3:
+            hex: "07000000430061007000730075006c0065003000300030003100"
+          efivars/Capsule0001-39b68c46-f7fb-441b-b6ec-16b0f69821f3:
+            hex: "01"
+        expect_exit_code: 3
+        post_checks:
+          - type: file_contains
+            path: "{dir}/capsule.log"
+            text: "CapsuleNNNN Variable Test: Capsule0001 Variable Test: WARNING"
+
+      - name: all_valid_variables_return_0_and_pass
+        type: module_main_with_env
+        patch_constants:
+          EFIVAR_PATH: "{dir}/efivars"
+          LOG_FILE: "{dir}/capsule.log"
+        dir_structure:
+          - path: efivars
+        bin_files:
+          efivars/OsIndicationsSupported-8be4df61-93ca-11d2-aa0d-00e098032b8c:
+            hex: "070000000400000000000000"
+          efivars/CapsuleMax-39b68c46-f7fb-441b-b6ec-16b0f69821f3:
+            hex: "06000000430061007000730075006c0065003000300030003100"
+          efivars/CapsuleLast-39b68c46-f7fb-441b-b6ec-16b0f69821f3:
+            hex: "07000000430061007000730075006c0065003000300030003100"
+          efivars/Capsule0001-39b68c46-f7fb-441b-b6ec-16b0f69821f3:
+            hex: "07000000AA"
+        expect_exit_code: 0
+        post_checks:
+          - type: ordered_contains
+            path: "{dir}/capsule.log"
+            texts:
+              - "Testing Capsule On-Disk Update Reporting Variables"
+              - "CapsuleMax Variable Test: PASSED"
+              - "CapsuleLast Variable Test: PASSED"
+              - "CapsuleNNNN Variable Test: Capsule0001 Variable Test: PASSED"
+              - "Overall Capsule On-Disk Update Reporting Variables Result: PASSED"
+
+      - name: all_valid_log_contains_os_indications_hex_value
+        type: module_main_with_env
+        patch_constants:
+          EFIVAR_PATH: "{dir}/efivars"
+          LOG_FILE: "{dir}/capsule.log"
+        dir_structure:
+          - path: efivars
+        bin_files:
+          efivars/OsIndicationsSupported-8be4df61-93ca-11d2-aa0d-00e098032b8c:
+            hex: "070000000400000000000000"
+          efivars/CapsuleMax-39b68c46-f7fb-441b-b6ec-16b0f69821f3:
+            hex: "06000000430061007000730075006c0065003000300030003100"
+          efivars/CapsuleLast-39b68c46-f7fb-441b-b6ec-16b0f69821f3:
+            hex: "07000000430061007000730075006c0065003000300030003100"
+          efivars/Capsule0001-39b68c46-f7fb-441b-b6ec-16b0f69821f3:
+            hex: "07000000AA"
+        expect_exit_code: 0
+        post_checks:
+          - type: regex
+            path: "{dir}/capsule.log"
+            pattern: "OsIndicationsSupported value: 0x[0-9A-F]+"

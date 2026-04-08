@@ -1,0 +1,234 @@
+suites:
+  - name: ethtool_test_hardware
+    files:
+      - SystemReady-devicetree-band/Yocto/meta-woden/recipes-acs/install-files/files/ethtool-test.py
+
+    cases:
+      - name: sys_class_net_exists
+        type: path_exists
+        path: /sys/class/net
+
+      - name: ip_command_available
+        type: command_success
+        command: which
+        args: ["ip"]
+
+      - name: ethtool_command_available
+        type: command_success
+        command: which
+        args: ["ethtool"]
+
+      - name: ip_link_lists_interfaces
+        type: command_output_regex
+        command: ip
+        args: ["-o", "link"]
+        expect_pattern: '^[0-9]+:\s+'
+        skip_unless_paths_exist:
+          - /sys/class/net
+        skip_unless_commands_succeed:
+          - "which ip"
+
+      - name: at_least_one_non_loopback_interface_present
+        type: command_output_regex
+        command: /bin/sh
+        args:
+          - -c
+          - |
+            ip -o link | awk -F': ' '{{print $2}}' | grep -Ev '^(lo)$'
+        expect_pattern: '.+'
+        skip_unless_commands_succeed:
+          - "which ip"
+
+      - name: at_least_one_physical_interface_present
+        type: command_output_regex
+        command: /bin/sh
+        args:
+          - -c
+          - |
+            found=0
+            for iface in $(ip -o link | awk -F': ' '{{print $2}}' | cut -d@ -f1); do
+              [ "$iface" = "lo" ] && continue
+              dev_path="/sys/class/net/$iface/device"
+              [ -e "$dev_path" ] || continue
+              resolved="$(readlink -f "$dev_path" 2>/dev/null || true)"
+              echo "$resolved" | grep -q '/virtual/' && continue
+              echo "$iface"
+              found=1
+              break
+            done
+            [ "$found" -eq 1 ]
+        expect_pattern: '.+'
+        skip_unless_paths_exist:
+          - /sys/class/net
+        skip_unless_commands_succeed:
+          - "which ip"
+
+      - name: ethtool_can_query_first_physical_interface
+        type: command_success
+        command: /bin/sh
+        args:
+          - -c
+          - |
+            iface=""
+            for i in $(ip -o link | awk -F': ' '{{print $2}}' | cut -d@ -f1); do
+              [ "$i" = "lo" ] && continue
+              dev_path="/sys/class/net/$i/device"
+              [ -e "$dev_path" ] || continue
+              resolved="$(readlink -f "$dev_path" 2>/dev/null || true)"
+              echo "$resolved" | grep -q '/virtual/' && continue
+              iface="$i"
+              break
+            done
+            [ -n "$iface" ] || exit 1
+            ethtool "$iface" >/dev/null 2>&1
+        skip_unless_commands_succeed:
+          - "which ip"
+          - "which ethtool"
+
+      - name: ethtool_driver_info_visible_for_first_physical_interface
+        type: command_output_regex
+        command: /bin/sh
+        args:
+          - -c
+          - |
+            iface=""
+            for i in $(ip -o link | awk -F': ' '{{print $2}}' | cut -d@ -f1); do
+              [ "$i" = "lo" ] && continue
+              dev_path="/sys/class/net/$i/device"
+              [ -e "$dev_path" ] || continue
+              resolved="$(readlink -f "$dev_path" 2>/dev/null || true)"
+              echo "$resolved" | grep -q '/virtual/' && continue
+              iface="$i"
+              break
+            done
+            [ -n "$iface" ] || exit 1
+            ethtool -i "$iface"
+        expect_pattern: '(driver|bus-info|supports-test)'
+        skip_unless_commands_succeed:
+          - "which ip"
+          - "which ethtool"
+
+      - name: ethtool_link_report_visible_for_first_physical_interface
+        type: command_output_regex
+        command: /bin/sh
+        args:
+          - -c
+          - |
+            iface=""
+            for i in $(ip -o link | awk -F': ' '{{print $2}}' | cut -d@ -f1); do
+              [ "$i" = "lo" ] && continue
+              dev_path="/sys/class/net/$i/device"
+              [ -e "$dev_path" ] || continue
+              resolved="$(readlink -f "$dev_path" 2>/dev/null || true)"
+              echo "$resolved" | grep -q '/virtual/' && continue
+              iface="$i"
+              break
+            done
+            [ -n "$iface" ] || exit 1
+            ethtool "$iface"
+        expect_pattern: 'Link detected:\s+(yes|no)'
+        skip_unless_commands_succeed:
+          - "which ip"
+          - "which ethtool"
+
+      - name: physical_interface_operstate_readable
+        type: command_output_regex
+        command: /bin/sh
+        args:
+          - -c
+          - |
+            iface=""
+            for i in $(ip -o link | awk -F': ' '{{print $2}}' | cut -d@ -f1); do
+              [ "$i" = "lo" ] && continue
+              dev_path="/sys/class/net/$i/device"
+              [ -e "$dev_path" ] || continue
+              resolved="$(readlink -f "$dev_path" 2>/dev/null || true)"
+              echo "$resolved" | grep -q '/virtual/' && continue
+              iface="$i"
+              break
+            done
+            [ -n "$iface" ] || exit 1
+            cat "/sys/class/net/$iface/operstate"
+        expect_pattern: '(up|down|unknown|dormant|lowerlayerdown|notpresent|testing)'
+        skip_unless_paths_exist:
+          - /sys/class/net
+
+      - name: physical_interface_carrier_file_readable_when_present
+        type: command_output_regex
+        command: /bin/sh
+        args:
+          - -c
+          - |
+            iface=""
+            for i in $(ip -o link | awk -F': ' '{{print $2}}' | cut -d@ -f1); do
+              [ "$i" = "lo" ] && continue
+              dev_path="/sys/class/net/$i/device"
+              [ -e "$dev_path" ] || continue
+              resolved="$(readlink -f "$dev_path" 2>/dev/null || true)"
+              echo "$resolved" | grep -q '/virtual/' && continue
+              iface="$i"
+              break
+            done
+            [ -n "$iface" ] || exit 1
+            [ -f "/sys/class/net/$iface/carrier" ] || exit 1
+            cat "/sys/class/net/$iface/carrier"
+        expect_pattern: '^[01]$'
+        skip_unless_paths_exist:
+          - /sys/class/net
+
+      - name: default_route_present
+        type: command_output_regex
+        command: ip
+        args: ["route", "show", "default"]
+        expect_pattern: '^default .* dev .*'
+        skip_unless_commands_succeed:
+          - "which ip"
+
+      - name: at_least_one_ipv4_address_present_on_non_loopback
+        type: command_output_regex
+        command: /bin/sh
+        args:
+          - -c
+          - |
+            ip -o -4 addr show | awk '$2 != "lo" {{print}}'
+        expect_pattern: '.+'
+        skip_unless_commands_succeed:
+          - "which ip"
+
+      - name: at_least_one_global_ipv6_address_present_when_available
+        type: command_output_regex
+        command: /bin/sh
+        args:
+          - -c
+          - |
+            ip -o -6 addr show scope global | awk '{{print}}'
+        expect_pattern: '.+'
+        skip_unless_commands_succeed:
+          - "which ip"
+          - "/bin/sh -c 'ip -o -6 addr show scope global | grep -q .'"
+
+      - name: gateway_ping_possible_when_available
+        type: command_success
+        command: /bin/sh
+        args:
+          - -c
+          - |
+            gw="$(ip route show default | awk '/default/ {{print $3; exit}}')"
+            iface="$(ip route show default | awk '/default/ {{for (i=1;i<=NF;i++) if ($i=="dev") {{print $(i+1); exit}}}}')"
+            [ -n "$gw" ] || exit 1
+            [ -n "$iface" ] || exit 1
+            ping -c 1 -W 5 -I "$iface" "$gw"
+        skip_unless_commands_succeed:
+          - "which ip"
+          - "which ping"
+
+      - name: run_real_ethtool_test_script_when_system_config_present
+        type: cli
+        args:
+          - /etc/system_config.txt
+        expect_exit_code_in: [0, 1, 2]
+        skip_unless_paths_exist:
+          - /etc/system_config.txt
+        skip_unless_commands_succeed:
+          - "which ip"
+          - "which ethtool"

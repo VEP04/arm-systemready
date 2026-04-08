@@ -1,0 +1,60 @@
+suites:
+  - name: read_write_check_blk_devices_hardware
+    files:
+      - SystemReady-devicetree-band/Yocto/meta-woden/recipes-acs/install-files/files/read_write_check_blk_devices.py
+
+    cases:
+      - name: lsblk_available
+        type: command_success
+        command: which
+        args: ["lsblk"]
+
+      - name: at_least_one_block_device_visible
+        type: command_output_regex
+        command: lsblk
+        args: ["-e", "7", "-d", "-n", "-o", "NAME"]
+        expect_pattern: '.+'
+
+      - name: root_disk_visible
+        type: command_output_regex
+        command: /bin/sh
+        args:
+          - -c
+          - |
+            lsblk -n -o NAME,TYPE | awk '$2=="disk" {{print $1; exit}}'
+        expect_pattern: '.+'
+
+      - name: partition_listing_works_when_partitions_exist
+        type: command_success
+        command: /bin/sh
+        args:
+          - -c
+          - |
+            disk="$(lsblk -n -o NAME,TYPE | awk '$2=="disk" {{print $1; exit}}')"
+            [ -n "$disk" ] || exit 1
+            lsblk "/dev/$disk" >/dev/null 2>&1
+
+      - name: safe_read_from_first_disk_possible
+        type: command_success
+        command: /bin/sh
+        args:
+          - -c
+          - |
+            disk="$(lsblk -n -o NAME,TYPE | awk '$2=="disk" {{print $1; exit}}')"
+            [ -n "$disk" ] || exit 1
+
+            # Skip if not readable (prevents false failures in VM/container)
+            if [ ! -r "/dev/$disk" ]; then
+              echo "Skipping unreadable disk /dev/$disk"
+              exit 0
+            fi
+
+            dd if="/dev/$disk" of=/dev/null bs=512 count=1 status=none
+
+        skip_unless_commands_succeed:
+          - "which lsblk"
+          - "which dd"
+
+      - name: run_real_block_device_check_script
+        type: cli
+        expect_exit_code_in: [0, 1, 2]
