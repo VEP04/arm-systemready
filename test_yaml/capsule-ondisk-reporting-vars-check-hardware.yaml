@@ -1,0 +1,50 @@
+suites:
+  - name: capsule_ondisk_reporting_vars_check_hardware
+    files:
+      - common/linux_scripts/capsule_ondisk_reporting_vars_check.py
+
+    cases:
+      - name: efivarfs_directory_exists
+        type: path_exists
+        path: /sys/firmware/efi/efivars
+
+      - name: efivarfs_directory_is_not_empty
+        type: command_output_regex
+        command: /bin/sh
+        args:
+          - -c
+          - |
+            ls -1 /sys/firmware/efi/efivars | head -n 1
+        expect_pattern: '.+'
+        skip_unless_paths_exist:
+          - /sys/firmware/efi/efivars
+
+      - name: os_indications_supported_variable_present_when_efi_available
+        type: command_output_regex
+        command: /bin/sh
+        args:
+          - -c
+          - |
+            ls /sys/firmware/efi/efivars/OsIndicationsSupported-* 2>/dev/null | head -n 1
+        expect_pattern: '.+'
+        skip_unless_paths_exist:
+          - /sys/firmware/efi/efivars
+
+      - name: capsule_related_variables_visible_when_present
+        type: command_output_regex
+        command: /bin/sh
+        args:
+          - -c
+          - |
+            ls /sys/firmware/efi/efivars/Capsule* 2>/dev/null | head -n 1
+        expect_pattern: '.+'
+        skip_unless_paths_exist:
+          - /sys/firmware/efi/efivars
+        skip_unless_commands_succeed:
+          - "/bin/sh -c 'ls /sys/firmware/efi/efivars/Capsule* 2>/dev/null | head -n 1 | grep -q .'"
+
+      - name: run_real_capsule_reporting_check
+        type: cli
+        expect_exit_code_in: [0, 1, 2, 3]
+        skip_unless_paths_exist:
+          - /sys/firmware/efi/efivars

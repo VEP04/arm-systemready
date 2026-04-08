@@ -1,0 +1,6 @@
+# Core dependencies
+# Add other required packages here
+
+# Optional: Allure reporting
+# Install with: pip install allure-pytest
+# allure-pytest

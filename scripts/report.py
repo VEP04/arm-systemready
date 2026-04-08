@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import re
 import shutil
 import subprocess
@@ -13,9 +14,26 @@ PROJECT_ROOT = SCRIPT_DIR.parent
 
 RUNNER_FILE = SCRIPT_DIR / "pytest_runner.py"
 REPORTS_DIR = PROJECT_ROOT / "reports"
+
 PYLINT_XML = REPORTS_DIR / "pylint-report.xml"
 PYLINT_LOG = REPORTS_DIR / "pylint.log"
+
+MYPY_XML = REPORTS_DIR / "mypy-report.xml"
+MYPY_LOG = REPORTS_DIR / "mypy.log"
+
 PYTEST_LOG = REPORTS_DIR / "pytest.log"
+
+
+class Color:
+    GREEN = "\033[92m"
+    RED = "\033[91m"
+    YELLOW = "\033[93m"
+    BLUE = "\033[94m"
+    RESET = "\033[0m"
+
+
+def color_text(text: str, color: str) -> str:
+    return f"{color}{text}{Color.RESET}"
 
 
 def ensure_reports_dir() -> None:
@@ -62,20 +80,58 @@ def get_commit_info() -> dict[str, str]:
 def cleanup_old_pytest_xml_reports() -> None:
     ensure_reports_dir()
     for xml_file in REPORTS_DIR.glob("*.xml"):
-        if xml_file.name == PYLINT_XML.name:
+        if xml_file.name in {PYLINT_XML.name, MYPY_XML.name}:
             continue
         xml_file.unlink(missing_ok=True)
 
 
-def run_pytest() -> int:
+def resolve_manual_target(target: str | None) -> Path | None:
+    if not target:
+        return None
+
+    raw = Path(target)
+    if raw.is_absolute():
+        return raw.resolve()
+    return (PROJECT_ROOT / raw).resolve()
+
+
+def get_manual_python_target(target: str | None, tool_name: str) -> list[Path] | None:
+    resolved_target = resolve_manual_target(target)
+    if resolved_target is None:
+        return None
+
+    if not resolved_target.exists() or not resolved_target.is_file():
+        print(
+            f"{color_text('WARNING:', Color.YELLOW)} "
+            f"Manual target for {tool_name} not found: {resolved_target}"
+        )
+        return []
+
+    if resolved_target.suffix != ".py":
+        print(
+            f"{color_text('WARNING:', Color.YELLOW)} "
+            f"Manual target is not a Python file for {tool_name}: {resolved_target}"
+        )
+        return []
+
+    return [resolved_target]
+
+
+def run_pytest(target: str | None = None, enable_allure: bool = False) -> int:
     if not RUNNER_FILE.exists():
         print(f"ERROR: Runner file not found: {RUNNER_FILE}")
         return 1
 
     cleanup_old_pytest_xml_reports()
 
+    cmd = [sys.executable, str(RUNNER_FILE)]
+    if target:
+        cmd.extend(["--target", target])
+    if enable_allure:
+        cmd.append("--enable-allure")
+
     result = subprocess.run(
-        [sys.executable, str(RUNNER_FILE)],
+        cmd,
         cwd=PROJECT_ROOT,
         capture_output=True,
         text=True,
@@ -135,17 +191,23 @@ def parse_pytest_xml(xml_file: Path) -> dict:
             if failure_node is not None:
                 status = "failed"
                 details = (
-                    failure_node.attrib.get("message") or failure_node.text or ""
+                    failure_node.attrib.get("message")
+                    or failure_node.text
+                    or ""
                 ).strip()
             elif error_node is not None:
                 status = "error"
                 details = (
-                    error_node.attrib.get("message") or error_node.text or ""
+                    error_node.attrib.get("message")
+                    or error_node.text
+                    or ""
                 ).strip()
             elif skipped_node is not None:
                 status = "skipped"
                 details = (
-                    skipped_node.attrib.get("message") or skipped_node.text or ""
+                    skipped_node.attrib.get("message")
+                    or skipped_node.text
+                    or ""
                 ).strip()
 
             testcases.append(
@@ -168,16 +230,22 @@ def parse_pytest_xml(xml_file: Path) -> dict:
     }
 
 
-def print_pytest_summary(results: list[dict], commit_info: dict[str, str]) -> None:
-    print("\n========== PYTEST REPORT ==========\n")
+def print_pytest_summary(
+    results: list[dict],
+    commit_info: dict[str, str],
+) -> None:
+    print(f"\n{color_text('========== PYTEST REPORT ==========', Color.BLUE)}\n")
     print(f"Branch  : {commit_info['branch']}")
     print(f"Commit  : {commit_info['commit']}")
     print(f"Git     : {commit_info['status']}")
 
     if not results:
-        print("\nWARNING: No XML reports found for pytest.")
+        print(
+            f"\n{color_text('WARNING:', Color.YELLOW)} "
+            "No XML reports found for pytest."
+        )
         print(f"Pytest log: {PYTEST_LOG.relative_to(PROJECT_ROOT)}")
-        print("\n===================================\n")
+        print(f"\n{color_text('===================================', Color.BLUE)}\n")
         return
 
     total = 0
@@ -210,26 +278,34 @@ def print_pytest_summary(results: list[dict], commit_info: dict[str, str]) -> No
                 }
             )
 
-    print(f"\nTotal   : {total}")
-    print(f"Passed  : {passed}")
-    print(f"Failed  : {failed}")
-    print(f"Errors  : {errors}")
-    print(f"Skipped : {skipped}")
+    print(f"\n{color_text('Total   :', Color.BLUE)} {total}")
+    print(f"{color_text('Passed  :', Color.GREEN)} {passed}")
+    print(f"{color_text('Failed  :', Color.RED)} {failed}")
+    print(f"{color_text('Errors  :', Color.RED)} {errors}")
+    print(f"{color_text('Warnings:', Color.YELLOW)} {skipped}")
 
     if all_testcases:
-        print("\nAll Test Cases:")
+        print(f"\n{color_text('All Test Cases:', Color.BLUE)}")
         for tc in all_testcases:
-            print(f"  - {tc['name']} [{tc['status']}]")
+            status = tc["status"]
+            if status == "passed":
+                label = color_text("[passed]", Color.GREEN)
+            elif status in {"failed", "error"}:
+                label = color_text(f"[{status}]", Color.RED)
+            else:
+                label = color_text("[warning]", Color.YELLOW)
+
+            print(f"  - {tc['name']} {label}")
             if tc["details"] and tc["status"] != "passed":
                 print(f"    {tc['details']}")
 
     if placeholder_notes:
-        print("\nPlaceholder Reports:")
+        print(f"\n{color_text('Placeholder Reports:', Color.YELLOW)}")
         for note in placeholder_notes:
             print(f"  - {note}")
 
     print(f"\nFull pytest log: {PYTEST_LOG.relative_to(PROJECT_ROOT)}")
-    print("\n===================================\n")
+    print(f"\n{color_text('===================================', Color.BLUE)}\n")
 
 
 def get_recently_changed_python_files() -> list[Path]:
@@ -284,19 +360,28 @@ def run_pylint_command(cmd: list[str]) -> subprocess.CompletedProcess[str]:
     )
 
 
-def run_pylint() -> int:
+def run_pylint(target: str | None = None) -> int:
     ensure_reports_dir()
 
     pylint_exe = shutil.which("pylint")
     if pylint_exe is None:
-        print("WARNING: pylint not found in PATH.")
+        print(f"{color_text('WARNING:', Color.YELLOW)} pylint not found in PATH.")
         create_empty_pylint_xml("pylint not installed")
         PYLINT_LOG.write_text("pylint not installed\n", encoding="utf-8")
         return 0
 
-    targets = get_recently_changed_python_files()
+    manual_targets = get_manual_python_target(target, "pylint")
+    targets = (
+        manual_targets
+        if manual_targets is not None
+        else get_recently_changed_python_files()
+    )
+
     if not targets:
-        print("WARNING: No recently changed Python files found by git for pylint.")
+        print(
+            f"{color_text('WARNING:', Color.YELLOW)} "
+            "No recently changed Python files found by git for pylint."
+        )
         create_empty_pylint_xml("no recently changed python files found")
         PYLINT_LOG.write_text(
             "no recently changed python files found\n",
@@ -304,12 +389,17 @@ def run_pylint() -> int:
         )
         return 0
 
-    print("[INFO] Running pylint on recently changed Python files:")
-    for target in targets:
+    print(
+        color_text(
+            "[INFO] Running pylint on recently changed Python files:",
+            Color.BLUE,
+        )
+    )
+    for target_path in targets:
         try:
-            rel = target.relative_to(PROJECT_ROOT)
+            rel = target_path.relative_to(PROJECT_ROOT)
         except ValueError:
-            rel = target
+            rel = target_path
         print(f"  - {rel}")
 
     parseable_cmd = [
@@ -352,7 +442,10 @@ def run_pylint() -> int:
         handle.write(score_result.stderr or "")
         handle.write("\n")
 
-    print(f"[INFO] Full pylint log saved to: {PYLINT_LOG.relative_to(PROJECT_ROOT)}")
+    print(
+        f"{color_text('[INFO]', Color.BLUE)} "
+        f"Full pylint log saved to: {PYLINT_LOG.relative_to(PROJECT_ROOT)}"
+    )
 
     write_pylint_xml(
         parseable_stdout=parseable_result.stdout,
@@ -402,7 +495,10 @@ def write_pylint_xml(
         testcase.set("classname", "pylint")
         testcase.set("name", rel)
 
-        issues = issues_by_file.get(str(target), []) or issues_by_file.get(rel, [])
+        issues = (
+            issues_by_file.get(str(target), [])
+            or issues_by_file.get(rel, [])
+        )
         if issues:
             failures += 1
             failure = ET.SubElement(testcase, "failure")
@@ -470,22 +566,25 @@ def get_pylint_score_from_xml(root: ET.Element) -> str:
 
 
 def print_pylint_summary(commit_info: dict[str, str]) -> None:
-    print("\n========== PYLINT REPORT ==========\n")
+    print(f"\n{color_text('========== PYLINT REPORT ==========', Color.BLUE)}\n")
     print(f"Branch  : {commit_info['branch']}")
     print(f"Commit  : {commit_info['commit']}")
     print(f"Git     : {commit_info['status']}")
 
     if not PYLINT_XML.exists():
-        print("\nWARNING: No pylint XML report found.")
-        print("\n===================================\n")
+        print(f"\n{color_text('WARNING:', Color.YELLOW)} No pylint XML report found.")
+        print(f"\n{color_text('===================================', Color.BLUE)}\n")
         return
 
     try:
         tree = ET.parse(PYLINT_XML)
         root = tree.getroot()
     except Exception as exc:  # pylint: disable=broad-exception-caught
-        print(f"\nWARNING: Failed to parse pylint XML report: {exc}")
-        print("\n===================================\n")
+        print(
+            f"\n{color_text('WARNING:', Color.YELLOW)} "
+            f"Failed to parse pylint XML report: {exc}"
+        )
+        print(f"\n{color_text('===================================', Color.BLUE)}\n")
         return
 
     total = int(root.attrib.get("tests", 0))
@@ -495,14 +594,14 @@ def print_pylint_summary(commit_info: dict[str, str]) -> None:
     passed = total - failures - errors - skipped
     pylint_score = get_pylint_score_from_xml(root)
 
-    print(f"\nTotal   : {total}")
-    print(f"Passed  : {passed}")
-    print(f"Failed  : {failures}")
-    print(f"Errors  : {errors}")
-    print(f"Skipped : {skipped}")
-    print(f"Score   : {pylint_score}")
+    print(f"\n{color_text('Total   :', Color.BLUE)} {total}")
+    print(f"{color_text('Passed  :', Color.GREEN)} {passed}")
+    print(f"{color_text('Failed  :', Color.RED)} {failures}")
+    print(f"{color_text('Errors  :', Color.RED)} {errors}")
+    print(f"{color_text('Warnings:', Color.YELLOW)} {skipped}")
+    print(f"{color_text('Score   :', Color.BLUE)} {pylint_score}")
 
-    print("\nDetailed Issues:\n")
+    print(f"\n{color_text('Detailed Issues:', Color.BLUE)}\n")
 
     for testcase in root.findall("testcase"):
         failure = testcase.find("failure")
@@ -512,15 +611,15 @@ def print_pylint_summary(commit_info: dict[str, str]) -> None:
         file_name = testcase.attrib.get("name", "unknown")
         details = (failure.text or "").strip().splitlines()
 
-        print(f"{file_name}")
+        print(color_text(file_name, Color.RED))
         for line in details:
             parts = line.split(":", 2)
             if len(parts) >= 3:
                 line_no = parts[1]
                 rest = parts[2].strip()
-                print(f"  - line {line_no}: {rest}")
+                print(color_text(f"  - line {line_no}: {rest}", Color.RED))
             else:
-                print(f"  - {line}")
+                print(color_text(f"  - {line}", Color.RED))
         print()
 
     system_out = root.findtext("system-out", default="").strip()
@@ -528,32 +627,291 @@ def print_pylint_summary(commit_info: dict[str, str]) -> None:
         print(f"Note: {system_out}")
 
     print(f"\nFull pylint log: {PYLINT_LOG.relative_to(PROJECT_ROOT)}")
-    print("\n===================================\n")
+    print(f"\n{color_text('===================================', Color.BLUE)}\n")
+
+
+def run_mypy_command(cmd: list[str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        cmd,
+        cwd=PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def run_mypy(target: str | None = None) -> int:
+    ensure_reports_dir()
+
+    mypy_exe = shutil.which("mypy")
+    if mypy_exe is None:
+        print(f"{color_text('WARNING:', Color.YELLOW)} mypy not found in PATH.")
+        create_empty_mypy_xml("mypy not installed")
+        MYPY_LOG.write_text("mypy not installed\n", encoding="utf-8")
+        return 0
+
+    manual_targets = get_manual_python_target(target, "mypy")
+    targets = (
+        manual_targets
+        if manual_targets is not None
+        else get_recently_changed_python_files()
+    )
+
+    if not targets:
+        print(
+            f"{color_text('WARNING:', Color.YELLOW)} "
+            "No recently changed Python files found by git for mypy."
+        )
+        create_empty_mypy_xml("no recently changed python files found")
+        MYPY_LOG.write_text(
+            "no recently changed python files found\n",
+            encoding="utf-8",
+        )
+        return 0
+
+    print(
+        color_text(
+            "[INFO] Running mypy on recently changed Python files:",
+            Color.BLUE,
+        )
+    )
+    for target_path in targets:
+        try:
+            rel = target_path.relative_to(PROJECT_ROOT)
+        except ValueError:
+            rel = target_path
+        print(f"  - {rel}")
+
+    cmd = [
+        mypy_exe,
+        "--show-error-codes",
+        "--no-color-output",
+        "--no-error-summary",
+        *[str(path) for path in targets],
+    ]
+    result = run_mypy_command(cmd)
+
+    with MYPY_LOG.open("w", encoding="utf-8") as handle:
+        handle.write("STDOUT\n")
+        handle.write("=" * 80 + "\n")
+        handle.write(result.stdout or "")
+        handle.write("\n\nSTDERR\n")
+        handle.write("=" * 80 + "\n")
+        handle.write(result.stderr or "")
+        handle.write("\n")
+
+    print(
+        f"{color_text('[INFO]', Color.BLUE)} "
+        f"Full mypy log saved to: {MYPY_LOG.relative_to(PROJECT_ROOT)}"
+    )
+
+    write_mypy_xml(
+        stdout=result.stdout,
+        stderr=result.stderr,
+        targets=targets,
+    )
+    return result.returncode
+
+
+def write_mypy_xml(
+    stdout: str,
+    stderr: str,
+    targets: list[Path],
+) -> None:
+    commit_info = get_commit_info()
+
+    testsuite = ET.Element("testsuite")
+    testsuite.set("name", "mypy")
+    testsuite.set("tests", str(len(targets)))
+
+    failures = 0
+    issues_by_file: dict[str, list[str]] = {}
+
+    for raw_line in stdout.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        match = re.match(
+            r"^(.*?\.py)(?::\d+)?(?::\d+)?:\s*(error|note):\s*(.*)$",
+            line,
+        )
+        if match:
+            file_key = match.group(1).strip()
+            issues_by_file.setdefault(file_key, []).append(line)
+
+    for target in targets:
+        try:
+            rel = str(target.relative_to(PROJECT_ROOT))
+        except ValueError:
+            rel = str(target)
+
+        testcase = ET.SubElement(testsuite, "testcase")
+        testcase.set("classname", "mypy")
+        testcase.set("name", rel)
+
+        issues = (
+            issues_by_file.get(str(target), [])
+            or issues_by_file.get(rel, [])
+        )
+        if issues:
+            failures += 1
+            failure = ET.SubElement(testcase, "failure")
+            failure.set("message", f"{len(issues)} mypy issue(s)")
+            failure.text = "\n".join(issues)
+
+    testsuite.set("failures", str(failures))
+    testsuite.set("errors", "0")
+    testsuite.set("skipped", "0")
+
+    system_out = ET.SubElement(testsuite, "system-out")
+    system_out.text = (
+        f"branch={commit_info['branch']}\n"
+        f"commit={commit_info['commit']}\n"
+        f"git_status={commit_info['status']}\n"
+        f"{stderr.strip()}".strip()
+    )
+
+    tree = ET.ElementTree(testsuite)
+    tree.write(MYPY_XML, encoding="utf-8", xml_declaration=True)
+
+
+def create_empty_mypy_xml(reason: str) -> None:
+    commit_info = get_commit_info()
+
+    testsuite = ET.Element("testsuite")
+    testsuite.set("name", "mypy")
+    testsuite.set("tests", "0")
+    testsuite.set("failures", "0")
+    testsuite.set("errors", "0")
+    testsuite.set("skipped", "0")
+
+    ET.SubElement(testsuite, "properties")
+
+    system_out = ET.SubElement(testsuite, "system-out")
+    system_out.text = (
+        f"branch={commit_info['branch']}\n"
+        f"commit={commit_info['commit']}\n"
+        f"git_status={commit_info['status']}\n"
+        f"reason={reason}"
+    )
+
+    tree = ET.ElementTree(testsuite)
+    tree.write(MYPY_XML, encoding="utf-8", xml_declaration=True)
+
+
+def print_mypy_summary(commit_info: dict[str, str]) -> None:
+    print(f"\n{color_text('=========== MYPY REPORT ===========', Color.BLUE)}\n")
+    print(f"Branch  : {commit_info['branch']}")
+    print(f"Commit  : {commit_info['commit']}")
+    print(f"Git     : {commit_info['status']}")
+
+    if not MYPY_XML.exists():
+        print(f"\n{color_text('WARNING:', Color.YELLOW)} No mypy XML report found.")
+        print(f"\n{color_text('===================================', Color.BLUE)}\n")
+        return
+
+    try:
+        tree = ET.parse(MYPY_XML)
+        root = tree.getroot()
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        print(
+            f"\n{color_text('WARNING:', Color.YELLOW)} "
+            f"Failed to parse mypy XML report: {exc}"
+        )
+        print(f"\n{color_text('===================================', Color.BLUE)}\n")
+        return
+
+    total = int(root.attrib.get("tests", 0))
+    failures = int(root.attrib.get("failures", 0))
+    errors = int(root.attrib.get("errors", 0))
+    skipped = int(root.attrib.get("skipped", 0))
+    passed = total - failures - errors - skipped
+
+    print(f"\n{color_text('Total   :', Color.BLUE)} {total}")
+    print(f"{color_text('Passed  :', Color.GREEN)} {passed}")
+    print(f"{color_text('Failed  :', Color.RED)} {failures}")
+    print(f"{color_text('Errors  :', Color.RED)} {errors}")
+    print(f"{color_text('Warnings:', Color.YELLOW)} {skipped}")
+
+    print(f"\n{color_text('Detailed Issues:', Color.BLUE)}\n")
+
+    for testcase in root.findall("testcase"):
+        failure = testcase.find("failure")
+        if failure is None:
+            continue
+
+        file_name = testcase.attrib.get("name", "unknown")
+        details = (failure.text or "").strip().splitlines()
+
+        print(color_text(file_name, Color.RED))
+        for line in details:
+            print(color_text(f"  - {line}", Color.RED))
+        print()
+
+    system_out = root.findtext("system-out", default="").strip()
+    if system_out and total == 0:
+        print(f"Note: {system_out}")
+
+    print(f"\nFull mypy log: {MYPY_LOG.relative_to(PROJECT_ROOT)}")
+    print(f"\n{color_text('===================================', Color.BLUE)}\n")
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Generate test reports and run analysis tools."
+    )
+    parser.add_argument(
+        "target",
+        nargs="?",
+        help="Manual target file for focused analysis",
+    )
+    parser.add_argument(
+        "--enable-allure",
+        action="store_true",
+        help="Enable Allure reporting in pytest_runner.py",
+    )
+    args = parser.parse_args()
+
     ensure_reports_dir()
     commit_info = get_commit_info()
 
-    pytest_exit_code = run_pytest()
-    pylint_exit_code = run_pylint()
+    if args.target:
+        print(
+            f"{color_text('[INFO]', Color.BLUE)} "
+            f"Manual target override enabled: {args.target}"
+        )
+
+    pytest_exit_code = run_pytest(args.target, enable_allure=args.enable_allure)
+    pylint_exit_code = run_pylint(args.target)
+    mypy_exit_code = run_mypy(args.target)
 
     pytest_results = []
     pytest_xml_files = sorted(REPORTS_DIR.glob("*.xml"))
-    pytest_xml_files = [path for path in pytest_xml_files if path.name != PYLINT_XML.name]
+    pytest_xml_files = [
+        path
+        for path in pytest_xml_files
+        if path.name not in {PYLINT_XML.name, MYPY_XML.name}
+    ]
 
     for xml_file in pytest_xml_files:
         try:
             pytest_results.append(parse_pytest_xml(xml_file))
         except Exception as exc:  # pylint: disable=broad-exception-caught
-            print(f"WARNING: Could not parse '{xml_file}': {exc}")
+            print(
+                f"{color_text('WARNING:', Color.YELLOW)} "
+                f"Could not parse '{xml_file}': {exc}"
+            )
 
     print_pytest_summary(pytest_results, commit_info)
     print_pylint_summary(commit_info)
+    print_mypy_summary(commit_info)
 
     if pytest_exit_code != 0:
         return pytest_exit_code
-    return pylint_exit_code
+    if pylint_exit_code != 0:
+        return pylint_exit_code
+    return mypy_exit_code
 
 
 if __name__ == "__main__":

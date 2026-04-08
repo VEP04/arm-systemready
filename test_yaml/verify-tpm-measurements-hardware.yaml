@@ -1,0 +1,54 @@
+suites:
+  - name: verify_tpm_measurements_hardware
+    files:
+      - common/linux_scripts/verify_tpm_measurements.py
+
+    cases:
+      - name: tpm_device_present
+        type: command_output_regex
+        command: /bin/sh
+        args:
+          - -c
+          - |
+            ls /dev/tpm* /dev/tpmrm* 2>/dev/null | head -n 1
+        expect_pattern: '.+'
+
+      - name: binary_bios_measurements_present_when_tpm_available
+        type: path_exists
+        path: /sys/kernel/security/tpm0/binary_bios_measurements
+        skip_unless_commands_succeed:
+          - "test -e /dev/tpm0 || test -e /dev/tpmrm0"
+
+      - name: tpm2_pcrread_available_when_installed
+        type: command_success
+        command: which
+        args: ["tpm2_pcrread"]
+        skip_unless_commands_succeed:
+          - "test -e /dev/tpm0 || test -e /dev/tpmrm0"
+          - "which tpm2_pcrread"
+
+      - name: tpm2_eventlog_available_when_installed
+        type: command_success
+        command: which
+        args: ["tpm2_eventlog"]
+        skip_unless_paths_exist:
+          - /sys/kernel/security/tpm0/binary_bios_measurements
+        skip_unless_commands_succeed:
+          - "which tpm2_eventlog"
+
+      - name: live_tpm_tools_can_generate_inputs
+        type: command_success
+        command: /bin/sh
+        args:
+          - -c
+          - |
+            tmpdir="$(mktemp -d)"
+            tpm2_pcrread sha256:0,1,2,3,4,5,6,7 > "$tmpdir/pcr.txt"
+            tpm2_eventlog /sys/kernel/security/tpm0/binary_bios_measurements > "$tmpdir/event.txt"
+            test -s "$tmpdir/pcr.txt"
+            test -s "$tmpdir/event.txt"
+        skip_unless_paths_exist:
+          - /sys/kernel/security/tpm0/binary_bios_measurements
+        skip_unless_commands_succeed:
+          - "which tpm2_pcrread"
+          - "which tpm2_eventlog"

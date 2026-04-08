@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import ast
 import importlib.util
 import os
@@ -18,13 +19,34 @@ from typing import Any, Callable
 
 import yaml
 
+# Optional Allure import
+try:
+    import allure  # type: ignore[import-not-found]
+    ALLURE_AVAILABLE = True
+except ImportError:
+    ALLURE_AVAILABLE = False
 
-PROJECT_ROOT = Path.cwd().resolve()
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parent
 TEST_YAML_DIR = PROJECT_ROOT / "test_yaml"
 REPORTS_DIR = PROJECT_ROOT / "reports"
 PLACEHOLDER_XML = REPORTS_DIR / "pytest-placeholder.xml"
 SUPPORTED_SUFFIXES = {".yaml", ".yml"}
 DEFAULT_CLI_TIMEOUT_SEC = 20
+DESTRUCTIVE_TEST_ENV = "RUN_DESTRUCTIVE_HW_TESTS"
+
+
+class Color:
+    GREEN = "\033[92m"
+    RED = "\033[91m"
+    YELLOW = "\033[93m"
+    BLUE = "\033[94m"
+    RESET = "\033[0m"
+
+
+def color_text(text: str, color: str) -> str:
+    return f"{color}{text}{Color.RESET}"
 
 
 @dataclass
@@ -60,6 +82,27 @@ class TestOutcome:
 
 class ConfigError(Exception):
     """Raised when a YAML configuration is invalid."""
+
+
+class SkipCase(Exception):
+    """Raised when a case should be skipped due to environment gating."""
+
+
+@dataclass
+class CommandRunResult:
+    command_text: str
+    stdout: str
+    stderr: str
+    exit_code: int | None
+    timed_out: bool
+    timeout_sec: int
+    shell_mode: bool
+
+
+@dataclass(frozen=True)
+class RunCaseOptions:
+    suite_command: str | None = None
+    allure_enabled: bool = False
 
 
 def discover_yaml_files() -> list[Path]:
@@ -180,6 +223,14 @@ def ensure_list_of_strings(value: Any, field_name: str) -> list[str]:
     return value
 
 
+def ensure_string_or_list_of_strings(value: Any, field_name: str) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    return ensure_list_of_strings(value, field_name)
+
+
 def normalize_suite_files(files_value: Any, field_name: str) -> list[str]:
     items = ensure_list(files_value, field_name)
     if not items:
@@ -251,6 +302,96 @@ def validate_post_checks(post_checks: Any, field_name: str) -> None:
                 raise ConfigError(f"{entry_name}.texts must be a list of strings")
 
 
+def validate_env_mapping(
+    value: Any,
+    field_name: str,
+    *,
+    allow_bool_values: bool = False,
+) -> None:
+    if not isinstance(value, dict):
+        raise ConfigError(f"{field_name} must be a mapping")
+
+    valid_value_types = (str, bool) if allow_bool_values else (str,)
+    for key, item in value.items():
+        if not isinstance(key, str):
+            raise ConfigError(f"{field_name} keys must be strings")
+        if not isinstance(item, valid_value_types):
+            raise ConfigError(
+                f"{field_name}['{key}'] must be "
+                f"{'string/bool' if allow_bool_values else 'a string'}"
+            )
+
+
+def validate_command_probe_list(value: Any, field_name: str) -> None:
+    probes = ensure_list(value, field_name)
+    for index, probe in enumerate(probes, start=1):
+        entry_name = f"{field_name}[{index}]"
+        if isinstance(probe, str):
+            continue
+        if not isinstance(probe, dict):
+            raise ConfigError(f"{entry_name} must be a string or mapping")
+
+        command = probe.get("command")
+        if not isinstance(command, str):
+            raise ConfigError(f"{entry_name}.command must be a string")
+
+        args = probe.get("args")
+        if args is not None and (
+            not isinstance(args, list) or not all(isinstance(item, str) for item in args)
+        ):
+            raise ConfigError(f"{entry_name}.args must be a list of strings")
+
+        shell_value = probe.get("shell")
+        if shell_value is not None and not isinstance(shell_value, bool):
+            raise ConfigError(f"{entry_name}.shell must be a boolean")
+
+        timeout_sec = probe.get("timeout_sec")
+        if timeout_sec is not None and (
+            not isinstance(timeout_sec, int) or timeout_sec <= 0
+        ):
+            raise ConfigError(f"{entry_name}.timeout_sec must be a positive integer")
+
+        cwd = probe.get("cwd")
+        if cwd is not None and not isinstance(cwd, str):
+            raise ConfigError(f"{entry_name}.cwd must be a string")
+
+        env = probe.get("env")
+        if env is not None:
+            validate_env_mapping(env, f"{entry_name}.env")
+
+
+def validate_common_case_controls(case_def: dict[str, Any], field_name: str) -> None:
+    skip_unless_env = case_def.get("skip_unless_env")
+    if skip_unless_env is not None:
+        validate_env_mapping(
+            skip_unless_env,
+            f"{field_name}.skip_unless_env",
+            allow_bool_values=True,
+        )
+
+    skip_unless_paths_exist = case_def.get("skip_unless_paths_exist")
+    if skip_unless_paths_exist is not None:
+        ensure_string_or_list_of_strings(
+            skip_unless_paths_exist,
+            f"{field_name}.skip_unless_paths_exist",
+        )
+
+    skip_unless_commands_succeed = case_def.get("skip_unless_commands_succeed")
+    if skip_unless_commands_succeed is not None:
+        validate_command_probe_list(
+            skip_unless_commands_succeed,
+            f"{field_name}.skip_unless_commands_succeed",
+        )
+
+    requires_destructive = case_def.get("requires_destructive")
+    if requires_destructive is not None and not isinstance(requires_destructive, bool):
+        raise ConfigError(f"{field_name}.requires_destructive must be a boolean")
+
+    required_env = case_def.get("required_env")
+    if required_env is not None:
+        validate_env_mapping(required_env, f"{field_name}.required_env")
+
+
 def validate_case_schema(case_def: dict[str, Any], field_name: str) -> None:
     case_name = case_def.get("name")
     if not isinstance(case_name, str) or not case_name.strip():
@@ -272,8 +413,16 @@ def validate_case_schema(case_def: dict[str, Any], field_name: str) -> None:
         "cli",
         "py_function",
         "module_main_with_env",
+        "path_exists",
+        "path_not_exists",
+        "command_success",
+        "command_exit_code",
+        "command_output_contains",
+        "command_output_regex",
     }:
         raise ConfigError(f"{field_name}.type unsupported: {case_type}")
+
+    validate_common_case_controls(case_def, field_name)
 
     if "scripts" in case_def and case_def["scripts"] is not None:
         scripts = case_def["scripts"]
@@ -381,6 +530,58 @@ def validate_case_schema(case_def: dict[str, Any], field_name: str) -> None:
             raise ConfigError(f"{field_name}.expect_exit_code must be an integer")
         return
 
+    if case_type in {"path_exists", "path_not_exists"}:
+        path_value = case_def.get("path")
+        if not isinstance(path_value, str):
+            raise ConfigError(f"{field_name}.path must be a string")
+        return
+
+    if case_type in {
+        "command_success",
+        "command_exit_code",
+        "command_output_contains",
+        "command_output_regex",
+    }:
+        command = case_def.get("command")
+        if not isinstance(command, str):
+            raise ConfigError(f"{field_name}.command must be a string")
+
+        args = case_def.get("args", [])
+        if not isinstance(args, list) or not all(isinstance(arg, str) for arg in args):
+            raise ConfigError(f"{field_name}.args must be a list of strings")
+
+        shell_value = case_def.get("shell", False)
+        if not isinstance(shell_value, bool):
+            raise ConfigError(f"{field_name}.shell must be a boolean")
+
+        timeout_sec = case_def.get("timeout_sec", DEFAULT_CLI_TIMEOUT_SEC)
+        if not isinstance(timeout_sec, int) or timeout_sec <= 0:
+            raise ConfigError(f"{field_name}.timeout_sec must be a positive integer")
+
+        cwd = case_def.get("cwd")
+        if cwd is not None and not isinstance(cwd, str):
+            raise ConfigError(f"{field_name}.cwd must be a string")
+
+        env = case_def.get("env")
+        if env is not None:
+            validate_env_mapping(env, f"{field_name}.env")
+
+        if case_type == "command_exit_code":
+            expected_exit_code = case_def.get("expect_exit_code")
+            if not isinstance(expected_exit_code, int):
+                raise ConfigError(f"{field_name}.expect_exit_code must be an integer")
+
+        if case_type == "command_output_contains":
+            expect_text = case_def.get("expect_text")
+            if not isinstance(expect_text, str):
+                raise ConfigError(f"{field_name}.expect_text must be a string")
+
+        if case_type == "command_output_regex":
+            expect_pattern = case_def.get("expect_pattern")
+            if not isinstance(expect_pattern, str):
+                raise ConfigError(f"{field_name}.expect_pattern must be a string")
+        return
+
     if case_type != "cli":
         return
 
@@ -412,11 +613,7 @@ def validate_case_schema(case_def: dict[str, Any], field_name: str) -> None:
 
     env = case_def.get("env")
     if env is not None:
-        if not isinstance(env, dict):
-            raise ConfigError(f"{field_name}.env must be a mapping")
-        for key, value in env.items():
-            if not isinstance(key, str) or not isinstance(value, str):
-                raise ConfigError(f"{field_name}.env entries must be string -> string")
+        validate_env_mapping(env, f"{field_name}.env")
 
     expected_exit_code = case_def.get("expect_exit_code")
     if expected_exit_code is not None and not isinstance(expected_exit_code, int):
@@ -425,6 +622,26 @@ def validate_case_schema(case_def: dict[str, Any], field_name: str) -> None:
     expect_exit_nonzero = case_def.get("expect_exit_nonzero", False)
     if not isinstance(expect_exit_nonzero, bool):
         raise ConfigError(f"{field_name}.expect_exit_nonzero must be a boolean")
+
+    expect_exit_code_in = case_def.get("expect_exit_code_in")
+    if expect_exit_code_in is not None:
+        if not isinstance(expect_exit_code_in, list) or not all(
+            isinstance(item, int) for item in expect_exit_code_in
+        ):
+            raise ConfigError(
+                f"{field_name}.expect_exit_code_in must be a list of integers"
+            )
+
+    expect_stdout_or_stderr_regex = case_def.get("expect_stdout_or_stderr_regex")
+    if expect_stdout_or_stderr_regex is not None:
+        if isinstance(expect_stdout_or_stderr_regex, str):
+            pass
+        elif not isinstance(expect_stdout_or_stderr_regex, list) or not all(
+            isinstance(item, str) for item in expect_stdout_or_stderr_regex
+        ):
+            raise ConfigError(
+                f"{field_name}.expect_stdout_or_stderr_regex must be a string or list of strings"
+            )
 
 
 def normalize_cases(value: Any, field_name: str) -> list[dict[str, Any]]:
@@ -759,6 +976,201 @@ def load_module_from_path(file_path: Path) -> Any:
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def normalize_completed_stream(stream: Any) -> str:
+    if stream is None:
+        return ""
+    if isinstance(stream, str):
+        return stream
+    if isinstance(stream, bytes):
+        return stream.decode("utf-8", errors="replace")
+    return str(stream)
+
+
+def build_command_from_spec(
+    file_path: Path,
+    spec: dict[str, Any],
+    work_dir: Path,
+) -> tuple[list[str] | str, bool]:
+    raw_args = spec.get("args", [])
+    if not isinstance(raw_args, list) or not all(isinstance(arg, str) for arg in raw_args):
+        raise ConfigError("'args' must be a list of strings")
+
+    command_value = spec.get("command")
+    if not isinstance(command_value, str):
+        raise ConfigError("'command' must be a string")
+
+    shell_mode = bool(spec.get("shell", False))
+    expanded_command = expand_template(command_value, work_dir, file_path)
+    expanded_args = [expand_template(arg, work_dir, file_path) for arg in raw_args]
+
+    if shell_mode:
+        parts = [expanded_command, *[shlex.quote(arg) for arg in expanded_args]]
+        return " ".join(parts), True
+
+    return [expanded_command, *expanded_args], False
+
+
+def build_runtime_env(
+    file_path: Path,
+    env_spec: Any,
+    work_dir: Path,
+) -> dict[str, str]:
+    env = os.environ.copy()
+    if env_spec is None:
+        return env
+
+    if not isinstance(env_spec, dict):
+        raise ConfigError("'env' must be a mapping")
+
+    for key, value in env_spec.items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            raise ConfigError("'env' entries must be string -> string")
+        env[key] = expand_template(value, work_dir, file_path)
+
+    return env
+
+
+def execute_command_spec(
+    file_path: Path,
+    spec: dict[str, Any],
+    work_dir: Path,
+    stdin_text: str | None = None,
+) -> CommandRunResult:
+    timeout_sec = spec.get("timeout_sec", DEFAULT_CLI_TIMEOUT_SEC)
+    if not isinstance(timeout_sec, int) or timeout_sec <= 0:
+        raise ConfigError("'timeout_sec' must be a positive integer")
+
+    cmd, shell_mode = build_command_from_spec(file_path, spec, work_dir)
+    run_env = build_runtime_env(file_path, spec.get("env"), work_dir)
+
+    cwd_value = spec.get("cwd")
+    if cwd_value is None:
+        cwd = work_dir
+    else:
+        if not isinstance(cwd_value, str):
+            raise ConfigError("'cwd' must be a string")
+        cwd = Path(expand_template(cwd_value, work_dir, file_path))
+
+    timed_out = False
+    stdout = ""
+    stderr = ""
+    exit_code: int | None = None
+
+    try:
+        completed = subprocess.run(
+            cmd,
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            input=stdin_text,
+            check=False,
+            env=run_env,
+            timeout=timeout_sec,
+            shell=shell_mode,
+        )
+        stdout = normalize_completed_stream(completed.stdout)
+        stderr = normalize_completed_stream(completed.stderr)
+        exit_code = completed.returncode
+    except subprocess.TimeoutExpired as exc:
+        timed_out = True
+        stdout = normalize_completed_stream(exc.stdout)
+        stderr = normalize_completed_stream(exc.stderr)
+
+    command_text = cmd if isinstance(cmd, str) else " ".join(cmd)
+    return CommandRunResult(
+        command_text=command_text,
+        stdout=stdout,
+        stderr=stderr,
+        exit_code=exit_code,
+        timed_out=timed_out,
+        timeout_sec=timeout_sec,
+        shell_mode=shell_mode,
+    )
+
+
+def normalize_probe_spec(probe: Any) -> dict[str, Any]:
+    if isinstance(probe, str):
+        return {
+            "command": probe,
+            "args": [],
+            "shell": True,
+            "timeout_sec": DEFAULT_CLI_TIMEOUT_SEC,
+        }
+    if isinstance(probe, dict):
+        return dict(probe)
+    raise ConfigError("Command probe must be a string or mapping")
+
+
+def apply_skip_controls(
+    file_path: Path,
+    case_def: dict[str, Any],
+    work_dir: Path,
+) -> None:
+    skip_unless_env = case_def.get("skip_unless_env", {})
+    if skip_unless_env:
+        if not isinstance(skip_unless_env, dict):
+            raise ConfigError("'skip_unless_env' must be a mapping")
+        for key, expected in skip_unless_env.items():
+            current = os.environ.get(key)
+            if isinstance(expected, bool):
+                present = bool(current)
+                if present != expected:
+                    raise SkipCase(
+                        f"[HW WARNING] Env presence mismatch for {key!r}: "
+                        f"got {present}, expected {expected}"
+                    )
+                continue
+            if current != expected:
+                raise SkipCase(
+                    f"[HW WARNING] Env mismatch for {key!r}: "
+                    f"got {current!r}, expected {expected!r}"
+                )
+
+    skip_unless_paths_exist = case_def.get("skip_unless_paths_exist", [])
+    for raw_path in ensure_string_or_list_of_strings(
+        skip_unless_paths_exist,
+        "skip_unless_paths_exist",
+    ):
+        resolved = Path(expand_template(raw_path, work_dir, file_path))
+        if not resolved.exists():
+            raise SkipCase(f"[HW WARNING] Missing required path: {resolved}")
+
+    skip_unless_commands_succeed = case_def.get("skip_unless_commands_succeed", [])
+    probes = ensure_list(skip_unless_commands_succeed, "skip_unless_commands_succeed")
+    for probe in probes:
+        probe_spec = normalize_probe_spec(probe)
+        result = execute_command_spec(file_path, probe_spec, work_dir)
+        if result.timed_out:
+            raise SkipCase(
+                f"[HW WARNING] Probe command timed out after {result.timeout_sec}s: "
+                f"{result.command_text}"
+            )
+        if result.exit_code != 0:
+            raise SkipCase(
+                f"[HW WARNING] Probe command failed with exit code "
+                f"{result.exit_code}: {result.command_text}"
+            )
+
+    if case_def.get("requires_destructive", False):
+        if os.environ.get(DESTRUCTIVE_TEST_ENV) != "1":
+            raise SkipCase(
+                f"[HW WARNING] Destructive test skipped. Set "
+                f"{DESTRUCTIVE_TEST_ENV}=1 to enable."
+            )
+
+    required_env = case_def.get("required_env", {})
+    if required_env:
+        if not isinstance(required_env, dict):
+            raise ConfigError("'required_env' must be a mapping")
+        for key, expected in required_env.items():
+            current = os.environ.get(key)
+            if current != expected:
+                raise ConfigError(
+                    f"required_env mismatch for {key!r}: "
+                    f"got {current!r}, expected {expected!r}"
+                )
 
 
 def check_file_exists(
@@ -1103,7 +1515,195 @@ def validate_output_expectations(
                 passed = False
                 conditions.append(f"stdout/stderr missing text: {candidate}")
 
+    expect_stdout_or_stderr_regex = case_def.get("expect_stdout_or_stderr_regex")
+    if expect_stdout_or_stderr_regex is not None:
+        candidates = (
+            [expect_stdout_or_stderr_regex]
+            if isinstance(expect_stdout_or_stderr_regex, str)
+            else ensure_list_of_strings(
+                expect_stdout_or_stderr_regex,
+                "expect_stdout_or_stderr_regex",
+            )
+        )
+        merged = stdout + "\n" + stderr
+        for pattern in candidates:
+            if re.search(pattern, merged, flags=re.MULTILINE) is None:
+                passed = False
+                conditions.append(f"stdout/stderr missing regex: {pattern}")
+
+    expect_exit_code_in = case_def.get("expect_exit_code_in")
+    if expect_exit_code_in is not None:
+        if not isinstance(expect_exit_code_in, list) or not all(
+            isinstance(item, int) for item in expect_exit_code_in
+        ):
+            raise ConfigError("'expect_exit_code_in' must be a list of integers")
+        actual_exit_code = case_def.get("_actual_exit_code")
+        if actual_exit_code not in expect_exit_code_in:
+            passed = False
+            conditions.append(
+                f"Expected exit code in {expect_exit_code_in}, got {actual_exit_code}"
+            )
+
     return passed, conditions
+
+
+def check_path_exists(
+    file_path: Path,
+    case_def: dict[str, Any],
+    work_dir: Path,
+) -> tuple[bool, str, str, bool]:
+    raw_path = case_def.get("path")
+    if not isinstance(raw_path, str):
+        raise ConfigError("'path_exists' requires a string 'path'")
+    resolved = Path(expand_template(raw_path, work_dir, file_path))
+    passed = resolved.exists()
+    message = f"Path exists: {resolved}" if passed else f"Path not found: {resolved}"
+    return passed, message, "", False
+
+
+def check_path_not_exists(
+    file_path: Path,
+    case_def: dict[str, Any],
+    work_dir: Path,
+) -> tuple[bool, str, str, bool]:
+    raw_path = case_def.get("path")
+    if not isinstance(raw_path, str):
+        raise ConfigError("'path_not_exists' requires a string 'path'")
+    resolved = Path(expand_template(raw_path, work_dir, file_path))
+    passed = not resolved.exists()
+    message = (
+        f"Path correctly absent: {resolved}"
+        if passed
+        else f"Path unexpectedly exists: {resolved}"
+    )
+    return passed, message, "", False
+
+
+def run_command_assertion(
+    file_path: Path,
+    case_def: dict[str, Any],
+    work_dir: Path,
+) -> tuple[CommandRunResult, list[str], bool]:
+    spec = {
+        "command": case_def.get("command"),
+        "args": case_def.get("args", []),
+        "shell": case_def.get("shell", False),
+        "timeout_sec": case_def.get("timeout_sec", DEFAULT_CLI_TIMEOUT_SEC),
+        "cwd": case_def.get("cwd"),
+        "env": case_def.get("env"),
+    }
+    result = execute_command_spec(file_path, spec, work_dir)
+    details = [
+        f"Command: {result.command_text}",
+        f"Shell mode: {'yes' if result.shell_mode else 'no'}",
+        f"Timeout seconds: {result.timeout_sec}",
+        f"Timed out: {'yes' if result.timed_out else 'no'}",
+        f"Exit code: {result.exit_code}",
+        "--- STDOUT ---",
+        result.stdout.rstrip(),
+        "--- STDERR ---",
+        result.stderr.rstrip(),
+    ]
+    return result, details, result.timed_out
+
+
+def check_command_success(
+    file_path: Path,
+    case_def: dict[str, Any],
+    work_dir: Path,
+) -> tuple[bool, str, str, bool]:
+    result, details, timed_out = run_command_assertion(file_path, case_def, work_dir)
+    if timed_out:
+        return (
+            False,
+            f"Command timed out after {result.timeout_sec}s",
+            "\n".join(details),
+            True,
+        )
+    passed = result.exit_code == 0
+    message = (
+        "Command succeeded"
+        if passed
+        else f"Expected exit code 0, got {result.exit_code}"
+    )
+    return passed, message, "\n".join(details), False
+
+
+def check_command_exit_code(
+    file_path: Path,
+    case_def: dict[str, Any],
+    work_dir: Path,
+) -> tuple[bool, str, str, bool]:
+    expected_exit_code = case_def.get("expect_exit_code")
+    if not isinstance(expected_exit_code, int):
+        raise ConfigError("'command_exit_code' requires integer 'expect_exit_code'")
+    result, details, timed_out = run_command_assertion(file_path, case_def, work_dir)
+    if timed_out:
+        return (
+            False,
+            f"Command timed out after {result.timeout_sec}s",
+            "\n".join(details),
+            True,
+        )
+    passed = result.exit_code == expected_exit_code
+    message = (
+        f"Command exited with expected code {expected_exit_code}"
+        if passed
+        else f"Expected exit code {expected_exit_code}, got {result.exit_code}"
+    )
+    return passed, message, "\n".join(details), False
+
+
+def check_command_output_contains(
+    file_path: Path,
+    case_def: dict[str, Any],
+    work_dir: Path,
+) -> tuple[bool, str, str, bool]:
+    expect_text = case_def.get("expect_text")
+    if not isinstance(expect_text, str):
+        raise ConfigError("'command_output_contains' requires string 'expect_text'")
+    result, details, timed_out = run_command_assertion(file_path, case_def, work_dir)
+    if timed_out:
+        return (
+            False,
+            f"Command timed out after {result.timeout_sec}s",
+            "\n".join(details),
+            True,
+        )
+    merged = result.stdout + "\n" + result.stderr
+    passed = expect_text in merged
+    message = (
+        f"Command output contains {expect_text!r}"
+        if passed
+        else f"Command output missing {expect_text!r}"
+    )
+    return passed, message, "\n".join(details), False
+
+
+def check_command_output_regex(
+    file_path: Path,
+    case_def: dict[str, Any],
+    work_dir: Path,
+) -> tuple[bool, str, str, bool]:
+    expect_pattern = case_def.get("expect_pattern")
+    if not isinstance(expect_pattern, str):
+        raise ConfigError("'command_output_regex' requires string 'expect_pattern'")
+    result, details, timed_out = run_command_assertion(file_path, case_def, work_dir)
+    if timed_out:
+        return (
+            False,
+            f"Command timed out after {result.timeout_sec}s",
+            "\n".join(details),
+            True,
+        )
+    merged = result.stdout + "\n" + result.stderr
+    passed = re.search(expect_pattern, merged, flags=re.MULTILINE) is not None
+    message = (
+        f"Command output matches regex {expect_pattern!r}"
+        if passed
+        else f"Command output does not match regex {expect_pattern!r}"
+    )
+    return passed, message, "\n".join(details), False
 
 
 def build_cli_command(
@@ -1149,16 +1749,6 @@ def build_cli_env(
         env[key] = expand_template(value, work_dir, file_path)
 
     return env
-
-
-def normalize_completed_stream(stream: Any) -> str:
-    if stream is None:
-        return ""
-    if isinstance(stream, str):
-        return stream
-    if isinstance(stream, bytes):
-        return stream.decode("utf-8", errors="replace")
-    return str(stream)
 
 
 def check_cli(
@@ -1269,6 +1859,12 @@ CHECK_HANDLERS: dict[
     "cli": check_cli,
     "py_function": check_py_function,
     "module_main_with_env": check_module_main_with_env,
+    "path_exists": check_path_exists,
+    "path_not_exists": check_path_not_exists,
+    "command_success": check_command_success,
+    "command_exit_code": check_command_exit_code,
+    "command_output_contains": check_command_output_contains,
+    "command_output_regex": check_command_output_regex,
 }
 
 
@@ -1281,6 +1877,8 @@ def run_single_check(
     if not isinstance(case_type, str):
         raise ConfigError("Case 'type' must be a string")
 
+    apply_skip_controls(file_path, case_def, work_dir)
+
     handler = CHECK_HANDLERS.get(case_type)
     if handler is None:
         raise ConfigError(f"Unsupported test type: {case_type}")
@@ -1288,30 +1886,69 @@ def run_single_check(
     return handler(file_path, case_def, work_dir)
 
 
+def get_file_work_dir(suite_name: str, file_entry: str) -> Path:
+    return (
+        REPORTS_DIR
+        / "_work"
+        / sanitize_name(suite_name)
+        / sanitize_name(Path(file_entry).stem)
+    )
+
+
+def append_combined_case_log(
+    file_work_dir: Path,
+    testcase_name: str,
+    status: str,
+    message: str,
+    details: str,
+) -> None:
+    file_work_dir.mkdir(parents=True, exist_ok=True)
+    log_path = file_work_dir / "combined.log"
+
+    lines = [
+        "=" * 80,
+        f"TEST CASE: {testcase_name}",
+        f"STATUS: {status}",
+        f"MESSAGE: {message}",
+    ]
+
+    if details:
+        lines.extend(["", details.rstrip()])
+
+    with log_path.open("a", encoding="utf-8") as handle:
+        handle.write("\n".join(lines).rstrip())
+        handle.write("\n\n")
+
+
 def run_case(
     suite_name: str,
     file_entry: str,
     case_index: int,
     case_def: dict[str, Any],
-    suite_command: str | None = None,
+    options: RunCaseOptions | None = None,
 ) -> TestOutcome:
+    if options is None:
+        options = RunCaseOptions()
+
     file_path = resolve_target_path(file_entry)
     case_name = case_def["name"].strip()
     testcase_name = f"{suite_name}::{Path(file_entry).name}::{case_name}"
+
+    if options.allure_enabled:
+        allure.dynamic.title(testcase_name)
+        allure.dynamic.description(f"Test case from {suite_name} for {file_entry}")
+        allure.dynamic.feature(suite_name)
+        allure.dynamic.story(case_name)
+        allure.dynamic.severity(allure.severity_level.NORMAL)
     case_type = str(case_def.get("type", "cli"))
 
-    work_dir = (
-        REPORTS_DIR
-        / "_work"
-        / sanitize_name(suite_name)
-        / sanitize_name(Path(file_entry).stem)
-        / sanitize_name(f"{case_index}_{case_name}")
-    )
+    file_work_dir = get_file_work_dir(suite_name, file_entry)
+    work_dir = file_work_dir / sanitize_name(f"{case_index}_{case_name}")
     work_dir.mkdir(parents=True, exist_ok=True)
 
     effective_case = dict(case_def)
-    if suite_command is not None and "command" not in effective_case:
-        effective_case["command"] = suite_command
+    if options.suite_command is not None and "command" not in effective_case:
+        effective_case["command"] = options.suite_command
 
     meta = TestMeta(
         suite_name=suite_name,
@@ -1323,7 +1960,7 @@ def run_case(
         passed, message, details, is_error = run_single_check(
             file_path, effective_case, work_dir
         )
-        return create_outcome(
+        outcome = create_outcome(
             testcase_name=testcase_name,
             file_path=file_entry,
             passed=passed,
@@ -1332,8 +1969,55 @@ def run_case(
             details=sanitize_xml_text(details),
             error=is_error,
         )
+        if options.allure_enabled:
+            allure.attach(
+                outcome.details,
+                name="Test Details",
+                attachment_type=allure.attachment_type.TEXT,
+            )
+            if not passed:
+                allure.attach(
+                    message,
+                    name="Failure Message",
+                    attachment_type=allure.attachment_type.TEXT,
+                )
+        status = "ERROR" if is_error else ("PASS" if passed else "FAIL")
+        append_combined_case_log(
+            file_work_dir=file_work_dir,
+            testcase_name=testcase_name,
+            status=status,
+            message=outcome.message,
+            details=outcome.details,
+        )
+        return outcome
+    except SkipCase as exc:
+        outcome = create_outcome(
+            testcase_name=testcase_name,
+            file_path=file_entry,
+            passed=True,
+            message=sanitize_xml_text(str(exc)),
+            meta=meta,
+            details=sanitize_xml_text(
+                f"Case skipped in work directory: {work_dir}\nReason: {exc}"
+            ),
+            skipped=True,
+        )
+        if options.allure_enabled:
+            allure.attach(
+                outcome.details,
+                name="Skip Details",
+                attachment_type=allure.attachment_type.TEXT,
+            )
+        append_combined_case_log(
+            file_work_dir=file_work_dir,
+            testcase_name=testcase_name,
+            status="SKIPPED",
+            message=outcome.message,
+            details=outcome.details,
+        )
+        return outcome
     except ConfigError as exc:
-        return create_outcome(
+        outcome = create_outcome(
             testcase_name=testcase_name,
             file_path=file_entry,
             passed=False,
@@ -1344,8 +2028,22 @@ def run_case(
             details=sanitize_xml_text(traceback.format_exc()),
             error=True,
         )
+        if options.allure_enabled:
+            allure.attach(
+                outcome.details,
+                name="Error Details",
+                attachment_type=allure.attachment_type.TEXT,
+            )
+        append_combined_case_log(
+            file_work_dir=file_work_dir,
+            testcase_name=testcase_name,
+            status="ERROR",
+            message=outcome.message,
+            details=outcome.details,
+        )
+        return outcome
     except Exception as exc:  # pylint: disable=broad-exception-caught
-        return create_outcome(
+        outcome = create_outcome(
             testcase_name=testcase_name,
             file_path=file_entry,
             passed=False,
@@ -1356,6 +2054,20 @@ def run_case(
             details=sanitize_xml_text(traceback.format_exc()),
             error=True,
         )
+        if options.allure_enabled:
+            allure.attach(
+                outcome.details,
+                name="Exception Details",
+                attachment_type=allure.attachment_type.TEXT,
+            )
+        append_combined_case_log(
+            file_work_dir=file_work_dir,
+            testcase_name=testcase_name,
+            status="ERROR",
+            message=outcome.message,
+            details=outcome.details,
+        )
+        return outcome
 
 
 def write_junit_xml(
@@ -1370,7 +2082,7 @@ def write_junit_xml(
     )
     errors = sum(1 for item in outcomes if item.error)
     skipped = sum(1 for item in outcomes if item.skipped)
-    passed = sum(1 for item in outcomes if item.passed)
+    passed = sum(1 for item in outcomes if item.passed and not item.skipped)
 
     testsuite = xml_et.Element("testsuite")
     testsuite.set("name", sanitize_xml_text(suite_name))
@@ -1441,32 +2153,41 @@ def print_group_summary(
     xml_report: Path,
 ) -> None:
     total = len(outcomes)
-    passed = sum(1 for item in outcomes if item.passed)
+    passed = sum(1 for item in outcomes if item.passed and not item.skipped)
     failures = sum(
         1 for item in outcomes if not item.passed and not item.error and not item.skipped
     )
     errors = sum(1 for item in outcomes if item.error)
-    skipped = sum(1 for item in outcomes if item.skipped)
+    warnings = sum(1 for item in outcomes if item.skipped)
 
-    print(f"\n[INFO] Finished group    : {suite_name}")
+    print(f"\n{color_text('[INFO]', Color.BLUE)} Finished group : {suite_name}")
     print(
-        f"[INFO] XML report        : "
+        f"{color_text('[INFO]', Color.BLUE)} XML report     : "
         f"{xml_report.relative_to(PROJECT_ROOT).as_posix()}"
     )
-    print(f"[INFO] Total             : {total}")
-    print(f"[INFO] Passed            : {passed}")
-    print(f"[INFO] Failed            : {failures}")
-    print(f"[INFO] Errors            : {errors}")
-    print(f"[INFO] Skipped           : {skipped}")
+    print(f"{color_text('Total   :', Color.BLUE)} {total}")
+    print(f"{color_text('Passed  :', Color.GREEN)} {passed}")
+    print(f"{color_text('Failed  :', Color.RED)} {failures}")
+    print(f"{color_text('Errors  :', Color.RED)} {errors}")
+    print(f"{color_text('Warnings:', Color.YELLOW)} {warnings}")
 
-    failed_items = [item for item in outcomes if not item.passed]
+    failed_items = [item for item in outcomes if not item.passed and not item.skipped]
     if failed_items:
-        print("[INFO] Failed checks:")
+        print(color_text("\n[FAILURES]", Color.RED))
         for item in failed_items:
             kind = "ERROR" if item.error else "FAIL"
             print(
-                f"  - [{kind}] {item.file_path} :: "
-                f"{item.testcase_name} :: {item.message}"
+                color_text(f"  - [{kind}] ", Color.RED)
+                + f"{item.file_path} :: {item.testcase_name} :: {item.message}"
+            )
+
+    warning_items = [item for item in outcomes if item.skipped]
+    if warning_items:
+        print(color_text("\n[WARNINGS]", Color.YELLOW))
+        for item in warning_items:
+            print(
+                color_text("  - [WARNING] ", Color.YELLOW)
+                + f"{item.file_path} :: {item.testcase_name} :: {item.message}"
             )
 
 
@@ -1575,19 +2296,49 @@ def select_yaml_runs(yaml_files: list[Path]) -> list[tuple[Path, set[str]]]:
     return list(selected_map.items())
 
 
-def run_yaml(yaml_file: Path, selected_targets: set[str]) -> int:
+def select_yaml_runs_for_target(
+    yaml_files: list[Path],
+    target: str,
+) -> list[tuple[Path, set[str]]]:
+    target_path = resolve_target_path(target)
+    selected_runs: list[tuple[Path, set[str]]] = []
+
+    for yaml_file in yaml_files:
+        try:
+            config = load_yaml_config(yaml_file)
+            suites = normalize_suites(config)
+        except ConfigError:
+            continue
+
+        matched_targets: set[str] = set()
+        for suite in suites:
+            for file_entry in suite["files"]:
+                if resolve_target_path(file_entry) == target_path:
+                    matched_targets.add(Path(file_entry).as_posix())
+
+        if matched_targets:
+            selected_runs.append((yaml_file, matched_targets))
+
+    return selected_runs
+
+
+def run_yaml(
+    yaml_file: Path,
+    selected_targets: set[str],
+    allure_enabled: bool = False,
+) -> int:
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
     group_name = get_group_name(yaml_file)
     xml_report = build_report_path(group_name, yaml_file)
 
-    print(f"\n[INFO] Running group      : {group_name}")
+    print(f"\n{color_text('[INFO]', Color.BLUE)} Running group : {group_name}")
     print(
-        f"[INFO] YAML file         : "
+        f"{color_text('[INFO]', Color.BLUE)} YAML file     : "
         f"{yaml_file.relative_to(PROJECT_ROOT).as_posix()}"
     )
     print(
-        f"[INFO] XML report        : "
+        f"{color_text('[INFO]', Color.BLUE)} XML report    : "
         f"{xml_report.relative_to(PROJECT_ROOT).as_posix()}"
     )
 
@@ -1608,7 +2359,10 @@ def run_yaml(yaml_file: Path, selected_targets: set[str]) -> int:
 
     for suite_index, suite in enumerate(suites, start=1):
         suite_name = suite["name"]
-        suite_command = suite.get("command")
+        run_case_options = RunCaseOptions(
+            suite_command=suite.get("command"),
+            allure_enabled=allure_enabled,
+        )
         suite_files = suite["files"]
         suite_cases = suite["cases"]
 
@@ -1621,7 +2375,7 @@ def run_yaml(yaml_file: Path, selected_targets: set[str]) -> int:
         if not filtered_files:
             continue
 
-        print(f"[INFO] Suite             : {suite_name}")
+        print(f"{color_text('[INFO]', Color.BLUE)} Suite         : {suite_name}")
 
         if not suite_cases:
             outcomes.append(
@@ -1642,7 +2396,7 @@ def run_yaml(yaml_file: Path, selected_targets: set[str]) -> int:
             continue
 
         for file_entry in filtered_files:
-            print(f"[INFO] Target file       : {file_entry}")
+            print(f"{color_text('[INFO]', Color.BLUE)} Target file   : {file_entry}")
             for case_index, case_def in enumerate(suite_cases, start=1):
                 outcomes.append(
                     run_case(
@@ -1650,7 +2404,7 @@ def run_yaml(yaml_file: Path, selected_targets: set[str]) -> int:
                         file_entry=file_entry,
                         case_index=case_index,
                         case_def=case_def,
-                        suite_command=suite_command,
+                        options=run_case_options,
                     )
                 )
 
@@ -1659,10 +2413,44 @@ def run_yaml(yaml_file: Path, selected_targets: set[str]) -> int:
 
     write_junit_xml(xml_report, group_name, yaml_file, outcomes)
     print_group_summary(group_name, outcomes, xml_report)
-    return 0 if all(item.passed for item in outcomes) else 1
+    return 0 if all(item.passed or item.skipped for item in outcomes) else 1
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Run YAML-driven tests for impacted files or a manual target."
+    )
+    parser.add_argument(
+        "--target",
+        help="Run tests only for the specified Python file target from YAML suites",
+    )
+    parser.add_argument(
+        "--enable-allure",
+        action="store_true",
+        help="Enable Allure reporting for enhanced test visualization",
+    )
+    parser.add_argument(
+        "--allure-report-dir",
+        default="reports/allure-report",
+        help="Directory to store Allure HTML report (default: reports/allure-report)",
+    )
+    args = parser.parse_args()
+
+    allure_enabled = False
+
+    if args.enable_allure:
+        if not ALLURE_AVAILABLE:
+            print(
+                f"{color_text('WARNING:', Color.YELLOW)} "
+                "Allure not available. Install allure-pytest for enhanced reporting. "
+                "Continuing without Allure."
+            )
+        else:
+            allure_report_dir = Path(args.allure_report_dir)
+            allure_report_dir.mkdir(parents=True, exist_ok=True)
+            os.environ["ALLURE_RESULTS_DIR"] = str(allure_report_dir / "allure-results")
+            allure_enabled = True
+
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
     cleanup_old_pytest_xml_reports()
 
@@ -1673,24 +2461,40 @@ def main() -> int:
             f"No YAML files found in "
             f"{TEST_YAML_DIR.relative_to(PROJECT_ROOT).as_posix()}"
         )
-        print(f"WARNING: {reason}")
+        print(f"{color_text('WARNING:', Color.YELLOW)} {reason}")
         create_placeholder_xml(reason)
         return 0
 
     remove_placeholder_xml()
 
-    selected_runs = select_yaml_runs(yaml_files)
+    if args.target:
+        print(
+            f"{color_text('[INFO]', Color.BLUE)} "
+            f"Manual target override enabled: {args.target}"
+        )
+        selected_runs = select_yaml_runs_for_target(yaml_files, args.target)
+    else:
+        selected_runs = select_yaml_runs(yaml_files)
 
     if not selected_runs:
-        print("[INFO] No impacted YAML test groups found for changed files.")
+        if args.target:
+            message = f"No YAML test groups found for manual target: {args.target}"
+        else:
+            message = "No impacted YAML test groups found for changed files."
+
+        print(f"{color_text('[INFO]', Color.BLUE)} {message}")
         print(
-            f"[INFO] Reports written to: "
+            f"{color_text('[INFO]', Color.BLUE)} Reports written to: "
             f"{REPORTS_DIR.relative_to(PROJECT_ROOT).as_posix()}"
         )
-        create_placeholder_xml("No impacted YAML test groups found for changed files")
+        create_placeholder_xml(message)
         return 0
 
-    print("[INFO] Running only impacted YAML test groups:")
+    if args.target:
+        print(color_text("[INFO] Running YAML test groups for manual target:", Color.BLUE))
+    else:
+        print(color_text("[INFO] Running only impacted YAML test groups:", Color.BLUE))
+
     for yaml_file, selected_targets in selected_runs:
         print(f"  - {yaml_file.relative_to(PROJECT_ROOT).as_posix()}")
         for target in sorted(selected_targets):
@@ -1698,13 +2502,43 @@ def main() -> int:
 
     overall_exit_code = 0
     for yaml_file, selected_targets in selected_runs:
-        exit_code = run_yaml(yaml_file, selected_targets=selected_targets)
+        exit_code = run_yaml(
+            yaml_file,
+            selected_targets=selected_targets,
+            allure_enabled=allure_enabled,
+        )
         if exit_code != 0:
             overall_exit_code = exit_code
 
-    print("\n[INFO] Custom YAML test execution completed.")
+    if allure_enabled:
+        print(f"\n{color_text('[INFO]', Color.BLUE)} Generating Allure report...")
+        allure_results_dir = Path(os.environ["ALLURE_RESULTS_DIR"])
+        allure_report_dir = allure_results_dir.parent
+        try:
+            subprocess.run(
+                [
+                    "allure",
+                    "generate",
+                    str(allure_results_dir),
+                    "-o",
+                    str(allure_report_dir),
+                    "--clean",
+                ],
+                check=True,
+            )
+            print(
+                f"{color_text('[INFO]', Color.BLUE)} "
+                f"Allure report generated at: {allure_report_dir}"
+            )
+        except subprocess.CalledProcessError as exc:
+            print(
+                f"{color_text('WARNING:', Color.YELLOW)} "
+                f"Failed to generate Allure report: {exc}"
+            )
+
+    print(f"\n{color_text('[INFO]', Color.BLUE)} Custom YAML test execution completed.")
     print(
-        f"[INFO] Reports written to: "
+        f"{color_text('[INFO]', Color.BLUE)} Reports written to: "
         f"{REPORTS_DIR.relative_to(PROJECT_ROOT).as_posix()}"
     )
     return overall_exit_code

@@ -1,0 +1,81 @@
+suites:
+  - name: runtime_device_mapping_conflict_checker_hardware
+    files:
+      - common/linux_scripts/runtime_device_mapping_conflict_checker.py
+
+    cases:
+      - name: dts_file_available
+        type: command_output_regex
+        command: /bin/sh
+        args:
+          - -c
+          - |
+            ls /sys/firmware/devicetree/base >/dev/null 2>&1 && echo present
+        expect_pattern: 'present'
+        skip_unless_paths_exist:
+          - /sys/firmware/devicetree/base
+
+      - name: memmap_source_available_when_exported
+        type: command_output_regex
+        command: /bin/sh
+        args:
+          - -c
+          - |
+            ls /tmp/memmap.log /var/log/memmap.log /boot/memmap.log 2>/dev/null | head -n 1
+        expect_pattern: '.+'
+        skip_unless_commands_succeed:
+          - "ls /tmp/memmap.log /var/log/memmap.log /boot/memmap.log >/dev/null 2>&1"
+
+      - name: exported_runtime_checker_inputs_exist_together
+        type: command_success
+        command: /bin/sh
+        args:
+          - -c
+          - |
+            test -d /sys/firmware/devicetree/base
+            ls /tmp/memmap.log /var/log/memmap.log /boot/memmap.log >/dev/null 2>&1
+        skip_unless_paths_exist:
+          - /sys/firmware/devicetree/base
+        skip_unless_commands_succeed:
+          - "ls /tmp/memmap.log /var/log/memmap.log /boot/memmap.log >/dev/null 2>&1"
+
+      - name: real_runtime_checker_can_run_when_inputs_are_exported
+        type: command_success
+        command: /bin/sh
+        args:
+          - -c
+          - |
+            tmpdir="$(mktemp -d)"
+            cp -r /sys/firmware/devicetree/base "$tmpdir/device_tree.dts"
+            memmap="$(ls /tmp/memmap.log /var/log/memmap.log /boot/memmap.log 2>/dev/null | head -n 1)"
+            [ -n "$memmap" ] || exit 1
+            python3 - <<'PY' "$1" "$tmpdir" "$memmap"
+            import importlib.util
+            import sys
+            from pathlib import Path
+
+            target = Path(sys.argv[1]).resolve()
+            work_dir = Path(sys.argv[2]).resolve()
+            memmap = Path(sys.argv[3]).resolve()
+
+            spec = importlib.util.spec_from_file_location("runtime_checker_under_test", target)
+            module = importlib.util.module_from_spec(spec)
+            assert spec and spec.loader
+            spec.loader.exec_module(module)
+
+            module.DTS_PATH = work_dir / "device_tree.dts"
+            module.MEMMAP_PATH = memmap
+            module.OUT_LOG_PATH = work_dir / "runtime_device_mapping_conflict_test.log"
+            module._LOG_FH = None
+
+            try:
+                module.main()
+            except SystemExit as exc:
+                code = exc.code if isinstance(exc.code, int) else 1
+                raise SystemExit(code)
+            PY
+            "{file}" "$tmpdir" "$memmap"
+        skip_unless_paths_exist:
+          - /sys/firmware/devicetree/base
+        skip_unless_commands_succeed:
+          - "ls /tmp/memmap.log /var/log/memmap.log /boot/memmap.log >/dev/null 2>&1"
