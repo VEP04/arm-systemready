@@ -48,3 +48,4 @@ suites:
         expect_exit_code_in: [0, 1, 2, 3]
         skip_unless_paths_exist:
           - /sys/firmware/efi/efivars
+

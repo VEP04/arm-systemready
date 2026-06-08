@@ -1,0 +1,260 @@
+suites:
+  - name: parser_common
+    files:
+      - common/parser/Parser.py
+
+    defaults:
+      type: cli
+      args:
+        - "{file}"
+      expect_exit_code: 0
+
+    cases:
+      # TEST:
+      # Verify that the target file exists in the repository.
+      #
+      # SETUP:
+      # No setup is required.
+      #
+      # EXPECTED:
+      # The file is present at the configured path.
+      - name: file_exists
+        type: file_exists
+        description: "Verify that Parser.py exists at the expected repository path."
+
+      # TEST:
+      # Ensure the script is syntactically valid Python.
+      #
+      # SETUP:
+      # No setup is required because the runner compiles the file directly.
+      #
+      # EXPECTED:
+      # Compilation succeeds without syntax errors.
+      - name: python_compiles
+        type: py_compile
+        description: "Ensure Parser.py compiles successfully as valid Python."
+
+      # TEST:
+      # Validate that the script exposes a standard CLI entry point.
+      #
+      # SETUP:
+      # No setup is required because this is a source-level structural check.
+      #
+      # EXPECTED:
+      # The file contains a __main__ guard.
+      - name: has_main_guard
+        type: main_guard
+        description: "Ensure the script contains a __main__ guard for standalone CLI execution."
+
+      # TEST:
+      # Validate handling of a missing configuration file.
+      #
+      # SETUP:
+      # Provide a config path that does not exist. No config file is created.
+      #
+      # EXPECTED:
+      # The script exits with a non-zero status.
+      - name: cli_missing_config_file_fails
+        description: "Ensure the script fails when the provided configuration file does not exist."
+        args:
+          - -bsa
+          - --config
+          - "{dir}/missing.ini"
+        expect_exit_nonzero: true
+
+      # TEST:
+      # Validate behavior when BSA output is requested but the configuration file
+      # does not contain a BSA section.
+      #
+      # SETUP:
+      # Create a valid config file containing only the AUTOMATION section.
+      # The BSA section is intentionally omitted.
+      #
+      # EXPECTED:
+      # The script exits successfully and prints a clear disabled-or-missing message.
+      - name: cli_bsa_disabled_or_missing_section_returns_message
+        description: "Verify that a missing BSA section is handled gracefully with a clear disabled-or-missing message."
+        args:
+          - -bsa
+          - --config
+          - "{dir}/config.ini"
+        scripts:
+          config.ini: |
+            # TEST SETUP:
+            # Create a minimal valid configuration file without a [BSA] section.
+            #
+            # EXPECTED RUNTIME EFFECT:
+            # The script should report that the BSA section is disabled or missing.
+            [AUTOMATION]
+            config_enabled_for_automation_run = true
+        expect_output:
+          - "BSA section is disabled or missing."
+
+      # TEST:
+      # Validate BSA command generation when BSA is enabled with explicit level
+      # and verbosity values.
+      #
+      # SETUP:
+      # Create a BSA section with automation enabled, level set to 3, and verbosity
+      # set to 1.
+      #
+      # EXPECTED:
+      # The generated command includes the BSA binary path plus -l 3 and -v 1.
+      - name: cli_bsa_enabled_builds_command_with_level_and_verbose
+        description: "Verify that enabled BSA configuration produces the correct command with level and verbosity flags."
+        args:
+          - -bsa
+          - --config
+          - "{dir}/config.ini"
+        scripts:
+          config.ini: |
+            # TEST SETUP:
+            # Enable BSA command generation and provide level/verbosity settings.
+            #
+            # EXPECTED RUNTIME EFFECT:
+            # The script should output a command containing:
+            #   /bin/bsa
+            #   -l 3
+            #   -v 1
+            [BSA]
+            automation_bsa_run = true
+            bsa_level = 3
+            bsa_verbose = 1
+        expect_output:
+          - "/bin/bsa"
+          - "-l 3"
+          - "-v 1"
+
+      # TEST:
+      # Validate that a minimal SBSA configuration still produces the base SBSA
+      # command.
+      #
+      # SETUP:
+      # Create an SBSA section with only the enable flag.
+      #
+      # EXPECTED:
+      # The script exits successfully and prints the base /bin/sbsa command.
+      - name: cli_sbsa_enabled_with_only_required_flag_prints_base_command
+        description: "Verify that enabling SBSA with only the required flag still produces the base SBSA command."
+        args:
+          - -sbsa
+          - --config
+          - "{dir}/config.ini"
+        scripts:
+          config.ini: |
+            # TEST SETUP:
+            # Minimal SBSA configuration with only the enable flag present.
+            #
+            # EXPECTED RUNTIME EFFECT:
+            # The script should print the base SBSA command.
+            [SBSA]
+            automation_sbsa_run = true
+        expect_output:
+          - "/bin/sbsa"
+
+      # TEST:
+      # Validate that a minimal FWTS configuration produces the base fwts command
+      # even when no module list is provided.
+      #
+      # SETUP:
+      # Create an FWTS section with only the enable flag.
+      #
+      # EXPECTED:
+      # The script exits successfully and prints the base fwts command.
+      - name: cli_fwts_enabled_without_module_prints_base_command
+        description: "Verify that enabling FWTS without specifying modules still produces the base fwts command."
+        args:
+          - -fwts
+          - --config
+          - "{dir}/config.ini"
+        scripts:
+          config.ini: |
+            # TEST SETUP:
+            # Minimal FWTS configuration with only the enable flag.
+            #
+            # EXPECTED RUNTIME EFFECT:
+            # The script should print the base fwts command.
+            [FWTS]
+            automation_fwts_run = true
+        expect_output:
+          - "fwts"
+
+      # TEST:
+      # Validate that the global automation flag is interpreted correctly when set
+      # to true.
+      #
+      # SETUP:
+      # Create an AUTOMATION section with config_enabled_for_automation_run = true.
+      #
+      # EXPECTED:
+      # The script prints True.
+      - name: cli_automation_true_prints_true
+        description: "Verify that the global automation flag is read correctly and prints True when enabled."
+        args:
+          - -automation
+          - --config
+          - "{dir}/config.ini"
+        scripts:
+          config.ini: |
+            # TEST SETUP:
+            # Global automation enabled.
+            #
+            # EXPECTED RUNTIME EFFECT:
+            # The script should print True.
+            [AUTOMATION]
+            config_enabled_for_automation_run = true
+        expect_output:
+          - "True"
+
+      # TEST:
+      # Validate that the global automation flag is interpreted correctly when set
+      # to false.
+      #
+      # SETUP:
+      # Create an AUTOMATION section with config_enabled_for_automation_run = false.
+      #
+      # EXPECTED:
+      # The script prints False.
+      - name: cli_automation_false_prints_false
+        description: "Verify that the global automation flag is read correctly and prints False when disabled."
+        args:
+          - -automation
+          - --config
+          - "{dir}/config.ini"
+        scripts:
+          config.ini: |
+            # TEST SETUP:
+            # Global automation disabled.
+            #
+            # EXPECTED RUNTIME EFFECT:
+            # The script should print False.
+            [AUTOMATION]
+            config_enabled_for_automation_run = false
+        expect_output:
+          - "False"
+
+      # TEST:
+      # Validate that malformed boolean values are rejected instead of being silently
+      # treated as valid true/false values.
+      #
+      # SETUP:
+      # Create an AUTOMATION section with an invalid boolean token.
+      #
+      # EXPECTED:
+      # The script exits with a non-zero status.
+      - name: cli_invalid_boolean_in_automation_check_fails
+        description: "Verify that an invalid boolean value in the AUTOMATION section causes the script to fail cleanly instead of being silently accepted."
+        args:
+          - -automation
+          - --config
+          - "{dir}/config.ini"
+        scripts:
+          config.ini: |
+            # TEST SETUP:
+            # Invalid boolean token used intentionally.
+            #
+            # EXPECTED RUNTIME EFFECT:
+            # The script should fail instead of accepting 'maybe' as a boolean.
+            [AUTOMATION]
+            config_enabled_for_automation_run = maybe
+        expect_exit_nonzero: true

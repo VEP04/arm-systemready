@@ -1,0 +1,125 @@
+suites:
+  - name: validate_sh
+    files:
+      - common/tools/validate.sh
+    cases:
+      - name: file_exists
+        type: file_exists
+
+      - name: uses_bash_shebang
+        type: source_contains
+        pattern: "#!/bin/bash"
+
+      - name: embeds_jsonschema_validation
+        type: source_contains_all
+        patterns:
+          - "SCHEMA_FILE="
+          - "from jsonschema import Draft7Validator"
+          - "v = Draft7Validator(schema)"
+
+      - name: help_flag_prints_usage_and_exits_zero
+        type: cli
+        command: bash
+        args:
+          - "{file}"
+          - "-h"
+        expect_exit_code: 0
+        expect_output: "Usage:"
+        skip_unless_commands_succeed:
+          - command: bash
+            args: ["-c", "exit 0"]
+
+      - name: no_args_fails_with_missing_json_message
+        type: cli
+        command: bash
+        args:
+          - "{file}"
+        expect_exit_code: 1
+        expect_output:
+          - "Missing JSON file argument"
+          - "Usage:"
+        skip_unless_commands_succeed:
+          - command: bash
+            args: ["-c", "exit 0"]
+
+      - name: missing_json_file_fails_before_python_runs
+        type: cli
+        command: bash
+        args:
+          - "{file}"
+          - "{dir}/missing-results.json"
+          - "{dir}/schema.json"
+        text_files:
+          schema.json: |
+            {}
+        expect_exit_code: 1
+        expect_output: "File not found:"
+        skip_unless_commands_succeed:
+          - command: bash
+            args: ["-c", "exit 0"]
+
+      - name: missing_schema_file_fails_with_schema_error
+        type: cli
+        command: bash
+        args:
+          - "{file}"
+          - "{dir}/results.json"
+          - "{dir}/missing-schema.json"
+        text_files:
+          results.json: |
+            {}
+        expect_exit_code: 1
+        expect_output: "Schema file not found:"
+        skip_unless_commands_succeed:
+          - command: bash
+            args: ["-c", "exit 0"]
+
+      - name: explicit_schema_path_happy_path_with_fake_python
+        type: cli
+        command: bash
+        args:
+          - -lc
+          - 'PATH="{dir}/bin:$PATH" bash "$1" "$2" "$3"'
+          - _
+          - "{file}"
+          - "{dir}/results.json"
+          - "{dir}/schema.json"
+        scripts:
+          bin/python3: |
+            #!/bin/sh
+            echo "$@" >> "{dir}/python3_calls.log"
+            cat >/dev/null
+            exit 0
+        text_files:
+          results.json: |
+            {}
+          schema.json: |
+            {}
+        expect_exit_code: 0
+        expect_output: "JSON Schema Validation"
+        post_checks:
+          - type: exists
+            path: "{dir}/python3_calls.log"
+          - type: file_contains
+            path: "{dir}/python3_calls.log"
+            text: "{dir}/results.json"
+          - type: file_contains
+            path: "{dir}/python3_calls.log"
+            text: "{dir}/schema.json"
+        skip_unless_commands_succeed:
+          - command: bash
+            args: ["-c", "exit 0"]
+
+      - name: warn_if_default_schema_path_is_missing
+        type: command_success
+        command: bash
+        args:
+          - -lc
+          - 'dir=$(dirname "$1"); [ -f "$dir/acs-merged-schema.json" ]'
+          - _
+          - "{file}"
+        warn_only: true
+        skip_unless_commands_succeed:
+          - command: bash
+            args: ["-c", "exit 0"]
+

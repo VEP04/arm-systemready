@@ -273,6 +273,80 @@ suites:
             path: "{dir}/fwts.json"
             text: "Description-based waiver"
 
+      - name: standalone_subtest_description_waiver_applies
+        type: cli
+        text_files:
+          standalone.json: |
+            {
+              "test_results": [
+                {
+                  "Test_suite": "Network",
+                  "Test_case": "ethtool_test",
+                  "subtests": [
+                    {
+                      "sub_Test_Description": "Ping to www.arm.com on eth0",
+                      "sub_test_result": "FAILED"
+                    }
+                  ],
+                  "test_suite_summary": {
+                    "total_passed": 0,
+                    "total_failed": 1,
+                    "total_failed_with_waiver": 0,
+                    "total_aborted": 0,
+                    "total_skipped": 0,
+                    "total_warnings": 0
+                  }
+                }
+              ],
+              "suite_summary": {
+                "total_passed": 0,
+                "total_failed": 1,
+                "total_failed_with_waiver": 0,
+                "total_aborted": 0,
+                "total_skipped": 0,
+                "total_warnings": 0
+              }
+            }
+          waiver.json: |
+            {
+              "Suites": [
+                {
+                  "Suite": "Standalone",
+                  "TestSuites": [
+                    {
+                      "TestCase": {
+                        "Test_case": "ethtool_test",
+                        "SubTests": [
+                          {
+                            "sub_Test_Description": "Ping to www.arm.com on eth0",
+                            "Reason": "Network stack excluded for this SKU"
+                          }
+                        ]
+                      }
+                    }
+                  ]
+                }
+              ]
+            }
+        args:
+          - Standalone
+          - "{dir}/standalone.json"
+          - "{dir}/waiver.json"
+        expect_exit_code: 0
+        post_checks:
+          - type: regex
+            path: "{dir}/standalone.json"
+            pattern: '"sub_test_result": "[^"]*WITH WAIVER[^"]*"'
+          - type: file_contains
+            path: "{dir}/standalone.json"
+            text: "Network stack excluded for this SKU"
+          - type: file_contains
+            path: "{dir}/standalone.json"
+            text: "\"total_failed\": 0"
+          - type: file_contains
+            path: "{dir}/standalone.json"
+            text: "\"total_failed_with_waiver\": 1"
+
       - name: fwts_does_not_duplicate_existing_with_waiver_marker
         type: cli
         text_files:
